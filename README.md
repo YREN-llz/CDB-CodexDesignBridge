@@ -4,7 +4,7 @@
 
 Codex Design Bridge (CDB) is a designer-first workspace embedded in Codex. It previews static frontend pages, sends editable layers to a local Figma development plugin, and applies supported Figma changes back to the existing source without using the official Figma MCP quota.
 
-Current source candidate: `0.7.0`. The Codex plugin build in this repository is `0.7.0+codex.20260808103256`; the workbench displays the public version `V 0.7.0`.
+Current source candidate: `0.7.0`. The Codex plugin build in this repository is `0.7.0+codex.20260812052840`; the workbench displays the public version `V 0.7.0`.
 
 This repository is the clean source distribution. It intentionally excludes local connection tokens, Codex/Figma runtime state, dependency caches, generated release archives, and machine-specific plugin caches.
 
@@ -31,6 +31,8 @@ This repository is the clean source distribution. It intentionally excludes loca
 4. CDB preflights the source. Safe deterministic fixes require an explicit report-bound action; blockers do not start the real workspace.
 5. Keep the local **CDB** development plugin open in Figma. Its **CDB Pages** list shows manifest pages and their sync state.
 6. Import the current/selected pages or update all changed pages. Supported Figma edits use the existing transactional fast lane; larger or ambiguous changes remain pending for Codex.
+
+Figma-first page creation automatically streams large selected Frames in validated chunks and reassembles them before a single transactional source write. Large Figma baselines are stored in UTF-8-safe plugin-data chunks below Figma's per-entry limit. The current safety envelope is 2,000 editable nodes and 64 MB of encoded page data; a missing or invalid chunk leaves the source and Figma mappings unchanged so the operation can be retried directly.
 
 Pages come from `.cdb/manifest.json`: HTML entries or routes are pages; CSS, JavaScript, images, SVGs, and fonts are dependencies. Runtime add/rename of fake pages is no longer supported.
 

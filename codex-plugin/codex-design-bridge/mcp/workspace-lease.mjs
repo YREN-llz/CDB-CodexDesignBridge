@@ -1,11 +1,21 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_HEARTBEAT_MS = 2_000;
 const DEFAULT_TTL_MS = 8_000;
 const HANDOFF_TIMEOUT_MS = 5_000;
+const LOCK_ACQUIRE_TIMEOUT_MS = 4_000;
+const LOCK_STALE_MS = 1_000;
 
 export class WorkspaceLeaseManager {
   constructor({
@@ -261,7 +271,7 @@ export class WorkspaceLeaseManager {
 
   async withLock(callback) {
     await mkdir(this.leaseRoot, { recursive: true });
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
     while (true) {
       try {
         await mkdir(this.lockPath);
@@ -271,8 +281,8 @@ export class WorkspaceLeaseManager {
         if (Date.now() >= deadline) throw new Error("CDB 工作台 lease 正忙，请重试。");
         try {
           const lockStat = await stat(this.lockPath);
-          if (Date.now() - lockStat.mtimeMs > 5_000) {
-            await rm(this.lockPath, { recursive: true, force: true });
+          if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
+            await removeLockDirectory(this.lockPath);
           }
         } catch {}
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -281,8 +291,16 @@ export class WorkspaceLeaseManager {
     try {
       return await callback();
     } finally {
-      await rm(this.lockPath, { recursive: true, force: true });
+      await removeLockDirectory(this.lockPath);
     }
+  }
+}
+
+async function removeLockDirectory(lockPath) {
+  try {
+    await rmdir(lockPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
   }
 }
 

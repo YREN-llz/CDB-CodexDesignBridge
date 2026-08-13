@@ -5,6 +5,10 @@ import {
   commitPatchTransaction,
   hashContent,
 } from "./patch-transaction.mjs";
+import {
+  assessStalePageChange,
+  collectCreatedPageNodeIds,
+} from "./page-change-compare.mjs";
 
 const MARKER_START = "/* Codex Design Bridge overrides: start */";
 const MARKER_END = "/* Codex Design Bridge overrides: end */";
@@ -30,6 +34,8 @@ const IGNORED_DIRECTORIES = new Set([
   "node_modules",
 ]);
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
+const MAX_INSERTED_PAGE_NODES = 200;
+const MAX_PAGE_SEED_NODES = 2000;
 const CHANGESET_PROTOCOL_VERSION = 14;
 const VECTOR_NODE_TYPES = new Set([
   "BOOLEAN_OPERATION",
@@ -67,6 +73,10 @@ export async function applyFastPageChanges({
   projectDir,
   changeSet,
   manifest,
+  baselineManifest = undefined,
+  baselineSourceHash = "",
+  currentManifest = null,
+  currentSourceHash = "",
 }) {
   const startedAt = Date.now();
   const root = path.resolve(projectDir);
@@ -83,11 +93,55 @@ export async function applyFastPageChanges({
   if (!manifest || manifest.pageId !== changeSet?.pageId) {
     return pendingResult(changes, "missing_page_mapping", startedAt);
   }
-  if (
-    typeof changeSet.sourceHash !== "string" ||
-    changeSet.sourceHash !== manifest.sourceHash
-  ) {
+  if (typeof changeSet.sourceHash !== "string") {
     return pendingResult(changes, "stale_page_mapping", startedAt);
+  }
+  const hasSourceContext =
+    Boolean(baselineSourceHash || currentSourceHash || currentManifest);
+  const mappedBaseline =
+    baselineManifest?.pageId === changeSet.pageId &&
+    baselineManifest.sourceHash === changeSet.sourceHash;
+  if (!hasSourceContext && changeSet.sourceHash !== manifest.sourceHash) {
+    return pendingResult(changes, "stale_page_mapping", startedAt);
+  }
+  const exactCurrentSource =
+    Boolean(currentSourceHash) && changeSet.sourceHash === currentSourceHash;
+  const requiresNodeRebase = hasSourceContext && !exactCurrentSource && (
+    mappedBaseline
+      ? !baselineSourceHash ||
+        !currentSourceHash ||
+        baselineSourceHash !== currentSourceHash
+      : changeSet.sourceHash !== manifest.sourceHash
+  );
+  if (requiresNodeRebase && !currentManifest?.root) {
+    return pendingResult(changes, "stale_page_mapping", startedAt);
+  }
+  const createdNodeIds = collectCreatedPageNodeIds(changes);
+  if (requiresNodeRebase) {
+    const assessments = changes.map((change) => ({
+      change,
+      assessment: assessStalePageChange({
+        change,
+        baselineManifest: mappedBaseline ? baselineManifest : null,
+        currentManifest,
+        createdNodeIds,
+      }),
+    }));
+    const conflict = assessments.find((entry) => !entry.assessment.ok);
+    if (conflict) {
+      return {
+        ...pendingResult(changes, "stale_change_set_conflict", startedAt),
+        pending: assessments.map(({ change, assessment }) =>
+          pendingChange(
+            change,
+            assessment.ok
+              ? "dependent_stale_change_conflict"
+              : assessment.reason,
+            "conflict",
+          ),
+        ),
+      };
+    }
   }
 
   const files = await listProjectFiles(root);
@@ -149,6 +203,7 @@ export async function applyFastPageChanges({
       const rendered = renderInsertedPageNode(
         change?.to?.node,
         path.extname(sourceFile).toLowerCase(),
+        MAX_PAGE_SEED_NODES,
       );
       if (!rendered.ok) {
         pending.push(pendingChange(change, rendered.reason));
@@ -1435,13 +1490,18 @@ function cloneMappedElement(source, selector, payload) {
   };
 }
 
-function renderInsertedPageNode(definition, extension) {
+function renderInsertedPageNode(
+  definition,
+  extension,
+  maxNodes = MAX_INSERTED_PAGE_NODES,
+) {
   const state = {
     ids: new Set(),
     count: 0,
     rules: [],
     assets: [],
     extension,
+    maxNodes,
   };
   try {
     const markup = renderInsertedPageNodeDefinition(definition, state);
@@ -1473,7 +1533,7 @@ class InsertedNodeError extends Error {
 function renderInsertedPageNodeDefinition(definition, state) {
   state.count += 1;
   if (
-    state.count > 200 ||
+    state.count > state.maxNodes ||
     !definition ||
     typeof definition !== "object" ||
     !["frame", "image", "svg", "text"].includes(definition.type)
@@ -1540,7 +1600,7 @@ function renderInsertedPageNodeDefinition(definition, state) {
     return `${opening}${exported.inner}</svg>`;
   }
   const children = Array.isArray(definition.children) ? definition.children : [];
-  if (children.length > 200) {
+  if (children.length > state.maxNodes) {
     throw new InsertedNodeError("invalid_inserted_node");
   }
   const typeAttribute = tag === "button" ? ' type="button"' : "";
@@ -1685,25 +1745,30 @@ function insertedNodeDeclarations(definition) {
   }
   if (definition.type === "frame") {
     const layout = definition.layout || {};
+    // CDB 0.7.0 initially serialized Figma GROUP and some instance sublayers
+    // as { kind: "flex", mode: null }. A missing Figma layoutMode means a
+    // normal non-auto-layout container, and treating only null/undefined as
+    // NONE is safe. Unknown non-null values remain rejected below.
+    const layoutMode = layout.mode == null ? "NONE" : layout.mode;
     if (layout.kind === "grid") {
       declarations.push(
         { property: "display", value: "grid" },
         { property: "grid-template-columns", value: safeCssLayoutValue(layout.grid?.columns) ? layout.grid.columns : "none" },
         { property: "grid-template-rows", value: safeCssLayoutValue(layout.grid?.rows) ? layout.grid.rows : "none" },
       );
-    } else if (layout.mode === "HORIZONTAL" || layout.mode === "VERTICAL") {
+    } else if (layoutMode === "HORIZONTAL" || layoutMode === "VERTICAL") {
       declarations.push(
         { property: "display", value: "flex" },
         {
           property: "flex-direction",
-          value: layout.mode === "HORIZONTAL" ? "row" : "column",
+          value: layoutMode === "HORIZONTAL" ? "row" : "column",
         },
       );
       declarations.push({
         property: "flex-wrap",
         value: layout.wrap ? "wrap" : "nowrap",
       });
-    } else if (layout.mode !== "NONE") {
+    } else if (layoutMode !== "NONE") {
       return null;
     }
     if (Number.isFinite(layout.itemSpacing) && layout.itemSpacing >= 0) {
@@ -1715,10 +1780,10 @@ function insertedNodeDeclarations(definition) {
     if (
       Number.isFinite(layout.counterAxisSpacing) &&
       layout.counterAxisSpacing >= 0 &&
-      layout.mode !== "NONE"
+      layoutMode !== "NONE"
     ) {
       declarations.push({
-        property: layout.mode === "HORIZONTAL" ? "row-gap" : "column-gap",
+        property: layoutMode === "HORIZONTAL" ? "row-gap" : "column-gap",
         value: `${formatNumber(layout.counterAxisSpacing)}px`,
       });
     }
@@ -1740,8 +1805,8 @@ function insertedNodeDeclarations(definition) {
     }[layout.counterAxisAlignItems];
     if (justify) declarations.push({ property: "justify-content", value: justify });
     if (align) declarations.push({ property: "align-items", value: align });
-    const primaryProperty = layout.mode === "HORIZONTAL" ? "width" : "height";
-    const counterProperty = layout.mode === "HORIZONTAL" ? "height" : "width";
+    const primaryProperty = layoutMode === "HORIZONTAL" ? "width" : "height";
+    const counterProperty = layoutMode === "HORIZONTAL" ? "height" : "width";
     if (layout.primaryAxisSizingMode === "AUTO") {
       declarations.push({ property: primaryProperty, value: "fit-content" });
     }

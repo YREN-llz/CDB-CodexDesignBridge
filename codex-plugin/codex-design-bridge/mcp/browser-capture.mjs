@@ -15,13 +15,21 @@ const CAPTURE_HEIGHT = 900;
 const START_TIMEOUT_MS = 12_000;
 const CDP_CALL_TIMEOUT_MS = 15_000;
 
-export async function captureLocalPreview({ previewUrl, projectDir, captureState }) {
+export async function captureLocalPreview({
+  previewUrl,
+  projectDir,
+  captureState,
+  width = CAPTURE_WIDTH,
+  height = CAPTURE_HEIGHT,
+}) {
+  const viewport = normalizeViewport(width, height);
   const playwright = await loadBundledPlaywright();
   if (playwright) {
     return captureWithPlaywright(playwright, {
       previewUrl,
       projectDir,
       captureState,
+      viewport,
     });
   }
 
@@ -40,16 +48,22 @@ export async function captureLocalPreview({ previewUrl, projectDir, captureState
       "--disable-background-networking",
       "--disable-default-apps",
       "--disable-extensions",
+      "--disable-features=OptimizationHints,MediaRouter,Translate",
       "--disable-gpu",
+      "--disable-component-update",
+      "--disable-sync",
       "--hide-scrollbars",
       "--no-default-browser-check",
       "--no-first-run",
+      "--metrics-recording-only",
+      "--password-store=basic",
+      "--use-mock-keychain",
       "--no-sandbox",
       "--remote-allow-origins=*",
       "--remote-debugging-address=127.0.0.1",
       `--remote-debugging-port=${port}`,
       `--user-data-dir=${profileDirectory}`,
-      `--window-size=${CAPTURE_WIDTH},${CAPTURE_HEIGHT}`,
+      `--window-size=${viewport.width},${viewport.height}`,
       "about:blank",
     ],
     {
@@ -69,6 +83,7 @@ export async function captureLocalPreview({ previewUrl, projectDir, captureState
       target.webSocketDebuggerUrl,
       previewUrl,
       captureState,
+      viewport,
     );
     const manifest = createCapturedPageManifest(snapshot, {
       projectName: path.basename(path.resolve(projectDir)),
@@ -83,9 +98,7 @@ export async function captureLocalPreview({ previewUrl, projectDir, captureState
     if (!diagnostics) throw error;
     throw new Error(`${error.message}\n${diagnostics}`);
   } finally {
-    await stopProcess(browser);
-    browser.stderr?.destroy();
-    await removeCaptureProfile(profileDirectory);
+    scheduleBrowserCleanup(browser, profileDirectory);
   }
 }
 
@@ -120,10 +133,16 @@ export async function captureLocalPreviewImage({
       "--disable-background-networking",
       "--disable-default-apps",
       "--disable-extensions",
+      "--disable-features=OptimizationHints,MediaRouter,Translate",
       "--disable-gpu",
+      "--disable-component-update",
+      "--disable-sync",
       "--hide-scrollbars",
       "--no-default-browser-check",
       "--no-first-run",
+      "--metrics-recording-only",
+      "--password-store=basic",
+      "--use-mock-keychain",
       "--no-sandbox",
       "--remote-allow-origins=*",
       "--remote-debugging-address=127.0.0.1",
@@ -147,15 +166,30 @@ export async function captureLocalPreviewImage({
       captureState,
     );
   } finally {
-    await stopProcess(browser);
-    browser.stderr?.destroy();
-    await removeCaptureProfile(profileDirectory, "codex-design-preview-");
+    scheduleBrowserCleanup(
+      browser,
+      profileDirectory,
+      "codex-design-preview-",
+    );
   }
+}
+
+function scheduleBrowserCleanup(
+  browser,
+  profileDirectory,
+  expectedPrefix = "codex-design-capture-",
+) {
+  browser.stderr?.destroy();
+  const cleanupProfile = () => {
+    void removeCaptureProfile(profileDirectory, expectedPrefix).catch(() => {});
+  };
+  browser.once("exit", cleanupProfile);
+  stopProcess(browser);
 }
 
 async function captureWithPlaywright(
   playwright,
-  { previewUrl, projectDir, captureState },
+  { previewUrl, projectDir, captureState, viewport },
 ) {
   const executablePath = await findBrowserExecutable();
   const browser = await playwright.chromium.launch({
@@ -165,7 +199,7 @@ async function captureWithPlaywright(
   });
   try {
     const page = await browser.newPage({
-      viewport: { width: CAPTURE_WIDTH, height: CAPTURE_HEIGHT },
+      viewport,
       deviceScaleFactor: 1,
     });
     await page.goto(previewUrl, {
@@ -335,7 +369,12 @@ async function loadBundledPlaywright() {
   return null;
 }
 
-async function captureTarget(webSocketUrl, previewUrl, captureState) {
+async function captureTarget(
+  webSocketUrl,
+  previewUrl,
+  captureState,
+  { width, height },
+) {
   const socket = new WebSocket(webSocketUrl);
   const pending = new Map();
   let nextId = 0;
@@ -398,8 +437,8 @@ async function captureTarget(webSocketUrl, previewUrl, captureState) {
     await call("Page.enable");
     await call("Runtime.enable");
     await call("Emulation.setDeviceMetricsOverride", {
-      width: CAPTURE_WIDTH,
-      height: CAPTURE_HEIGHT,
+      width,
+      height,
       deviceScaleFactor: 1,
       mobile: false,
     });
@@ -652,21 +691,14 @@ async function reservePort() {
   return port;
 }
 
-async function stopProcess(child) {
+function stopProcess(child) {
   if (!child?.pid || child.exitCode !== null) return;
-  if (process.platform === "win32") {
-    await new Promise((resolve) => {
-      const killer = spawn(
-        "taskkill.exe",
-        ["/pid", String(child.pid), "/t", "/f"],
-        { windowsHide: true, stdio: "ignore" },
-      );
-      killer.once("error", resolve);
-      killer.once("exit", resolve);
-    });
-    return;
+  try {
+    child.kill(process.platform === "win32" ? undefined : "SIGTERM");
+  } catch {
+    // The capture result is already complete; cleanup must never block it.
   }
-  child.kill("SIGTERM");
+  child.unref?.();
 }
 
 async function removeCaptureProfile(

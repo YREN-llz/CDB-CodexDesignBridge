@@ -198,6 +198,16 @@ export async function commitPatchTransaction({
 export async function undoLastPatchTransaction(projectDir) {
   const root = path.resolve(projectDir);
   const transaction = await latestUndoableTransaction(root);
+  return undoPatchTransaction(root, transaction);
+}
+
+export async function undoPatchTransactionById(projectDir, transactionId) {
+  const root = path.resolve(projectDir);
+  const transaction = await transactionById(root, transactionId);
+  return undoPatchTransaction(root, transaction);
+}
+
+async function undoPatchTransaction(root, transaction) {
   if (!transaction) {
     return {
       transactionId: "",
@@ -331,6 +341,36 @@ async function latestUndoableTransaction(root) {
     }
   }
   return null;
+}
+
+async function transactionById(root, transactionId) {
+  if (
+    typeof transactionId !== "string" ||
+    !/^[0-9]+-[0-9a-f-]{36}$/i.test(transactionId)
+  ) {
+    return null;
+  }
+  const transactionRoot = path.join(
+    root,
+    ".figma-sync",
+    "transactions",
+    transactionId,
+  );
+  try {
+    const journal = JSON.parse(
+      await readFile(path.join(transactionRoot, "transaction.json"), "utf8"),
+    );
+    if (
+      journal.transactionId !== transactionId ||
+      journal.status !== "committed" ||
+      journal.undoable === false
+    ) {
+      return null;
+    }
+    return { root: transactionRoot, journal };
+  } catch {
+    return null;
+  }
 }
 
 async function pruneTransactions(root, limit) {

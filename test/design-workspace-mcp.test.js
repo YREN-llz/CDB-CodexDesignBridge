@@ -3,16 +3,18 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
 import { commitPatchTransaction } from "../codex-plugin/codex-design-bridge/mcp/patch-transaction.mjs";
+import { createFigmaSeedProject } from "../codex-plugin/codex-design-bridge/mcp/project-contract.mjs";
 
 const pluginRoot = process.env.DESIGN_WORKSPACE_PLUGIN_ROOT
   ? path.resolve(process.env.DESIGN_WORKSPACE_PLUGIN_ROOT)
   : path.resolve("codex-plugin", "codex-design-bridge");
 const serverPath = path.join(pluginRoot, "mcp", "server.mjs");
+let clientRegistrySequence = 0;
 
 test("publishes one CDB launcher entry with direct project actions", async () => {
   const manifest = JSON.parse(
@@ -110,6 +112,23 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   );
   assert.ok(listed.tools.some((tool) => tool.name === "open_design_launcher"));
   assert.ok(listed.tools.some((tool) => tool.name === "resolve_design_source"));
+  const locationTool = listed.tools.find(
+    (tool) => tool.name === "choose_local_project_location",
+  );
+  assert.ok(locationTool);
+  assert.equal(locationTool.annotations.readOnlyHint, true);
+  assert.deepEqual(locationTool.inputSchema.properties.purpose.enum, [
+    "design",
+    "figma",
+    "open",
+  ]);
+  assert.ok(listed.tools.some((tool) => tool.name === "list_design_projects"));
+  assert.ok(
+    listed.tools.some(
+      (tool) => tool.name === "open_registered_design_project",
+    ),
+  );
+  assert.ok(listed.tools.some((tool) => tool.name === "forget_design_project"));
   assert.ok(listed.tools.some((tool) => tool.name === "create_design_project"));
   assert.ok(listed.tools.some((tool) => tool.name === "create_figma_seed_project"));
   assert.ok(listed.tools.some((tool) => tool.name === "preflight_design_project"));
@@ -178,6 +197,17 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   assert.match(resource.contents[0].text, /让 Codex 处理/);
   assert.match(resource.contents[0].text, /handoffPendingFigmaChanges/);
   assert.match(resource.contents[0].text, /sendFollowUpMessage/);
+  assert.match(resource.contents[0].text, /choose_local_project_location/);
+  assert.match(resource.contents[0].text, /id="launcherProjectsTitle">项目管理/);
+  assert.match(resource.contents[0].text, /id="projectMenuButton"/);
+  assert.match(resource.contents[0].text, /id="projectDialog"/);
+  assert.match(resource.contents[0].text, /打开本地项目/);
+  assert.match(resource.contents[0].text, /list_design_projects/);
+  assert.match(resource.contents[0].text, /open_registered_design_project/);
+  assert.match(resource.contents[0].text, /forget_design_project/);
+  assert.match(resource.contents[0].text, /本地项目文件未删除/);
+  assert.match(resource.contents[0].text, /选择位置并新建/);
+  assert.match(resource.contents[0].text, /createLocalProject/);
   assert.doesNotMatch(
     resource.contents[0].text,
     /void handoffPendingFigmaChanges\(\);/,
@@ -276,7 +306,7 @@ test("opens the active localhost preview route through the browser helper", asyn
   const projectDir = await mkdtemp(
     path.join(os.tmpdir(), "design-workspace-browser-open-"),
   );
-  const capturePath = path.join(projectDir, "opened-url.txt");
+  const capturePath = path.join(projectDir, "browser-launch.json");
   await writeFile(
     path.join(projectDir, "index.html"),
     '<!doctype html><title>Browser open</title><main data-codex-root data-codex-id="home-root"><h1 data-codex-id="home-title">Ready</h1></main>',
@@ -292,7 +322,7 @@ test("opens the active localhost preview route through the browser helper", asyn
     { id: "design", name: "Design", entry: "design.html", route: "/design.html" },
   ]);
   const client = startClient({
-    CODEX_DESIGN_BRIDGE_BROWSER_OPEN_CAPTURE_PATH: capturePath,
+    CODEX_DESIGN_BRIDGE_BROWSER_LAUNCH_CAPTURE_PATH: capturePath,
   });
   t.after(async () => {
     await client.close();
@@ -327,9 +357,20 @@ test("opens the active localhost preview route through the browser helper", asyn
     name: "open_design_preview_in_browser",
     arguments: { projectDir, pageId: designPage.id },
   });
-  const openedUrl = new URL(await readFile(capturePath, "utf8"));
+  const launch = JSON.parse(await readFile(capturePath, "utf8"));
+  const openedUrl = new URL(launch.args.at(-1));
   assert.equal(openedUrl.hostname, "127.0.0.1");
   assert.equal(openedUrl.pathname, "/design.html");
+  if (process.platform === "win32") {
+    const windowsRoot =
+      process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+    assert.equal(
+      launch.command,
+      path.join(windowsRoot, "System32", "rundll32.exe"),
+    );
+    assert.equal(path.isAbsolute(launch.command), true);
+    assert.equal(launch.args[0], "url.dll,FileProtocolHandler");
+  }
   assert.match(opened.structuredContent.workspace.message, /默认浏览器/);
 });
 
@@ -378,6 +419,9 @@ test("opens an unbound launcher and creates a ready native design without questi
   assert.match(workspace.projectName, /typography stu/i);
   assert.equal(workspace.preflightReport.status, "pass");
   assert.equal(workspace.lease.owned, true);
+  assert.equal(workspace.projectKey, workspace.preflightReport.projectKey);
+  assert.equal(workspace.projectCatalog.length, 1);
+  assert.equal(workspace.projectCatalog[0].active, true);
   for (const relative of [
     "index.html",
     "styles.css",
@@ -396,6 +440,7 @@ test("opens an unbound launcher and creates a ready native design without questi
   assert.equal(seedWorkspace.phase, "ready", JSON.stringify(seedWorkspace));
   assert.equal(path.basename(seedWorkspace.projectDir), "figma-first");
   assert.equal(seedWorkspace.pages[0].acceptsFigmaSeed, true);
+  assert.equal(seedWorkspace.pages[0].id, "figma-first-home");
   const seedManifest = JSON.parse(
     await readFile(
       path.join(seedWorkspace.projectDir, ".cdb", "manifest.json"),
@@ -403,6 +448,42 @@ test("opens an unbound launcher and creates a ready native design without questi
     ),
   );
   assert.equal(seedManifest.source.kind, "figma-seed");
+
+  const listedProjects = await client.request("tools/call", {
+    name: "list_design_projects",
+    arguments: {},
+  });
+  assert.equal(listedProjects.structuredContent.projectCatalog.length, 2);
+  assert.equal(
+    listedProjects.structuredContent.projectCatalog.filter((project) => project.active).length,
+    1,
+  );
+
+  const switched = await client.request("tools/call", {
+    name: "open_registered_design_project",
+    arguments: { projectKey: workspace.projectKey },
+  });
+  assert.equal(switched.structuredContent.workspace.projectKey, workspace.projectKey);
+  assert.equal(switched.structuredContent.workspace.preflightReport.status, "pass");
+  assert.equal(switched.structuredContent.workspace.projectCatalog.length, 2);
+
+  const forgotten = await client.request("tools/call", {
+    name: "forget_design_project",
+    arguments: { projectKey: seedWorkspace.projectKey },
+  });
+  assert.deepEqual(
+    forgotten.structuredContent.projectCatalog.map((project) => project.projectKey),
+    [workspace.projectKey],
+  );
+  assert.equal(
+    JSON.parse(
+      await readFile(
+        path.join(seedWorkspace.projectDir, ".cdb", "manifest.json"),
+        "utf8",
+      ),
+    ).source.kind,
+    "figma-seed",
+  );
 });
 
 test("imports an isolated static HTML project and opens its pages", async (t) => {
@@ -699,6 +780,53 @@ test("ends cleanly and confirms only when Figma has unsent changes", async (t) =
   assert.equal(ended.structuredContent.workspace.previewUrl, "");
   assert.equal(ended.structuredContent.workspace.needsEndConfirmation, false);
   assert.equal(ended.structuredContent.workspace.summary, "本次设计已结束。");
+
+  const switchParent = path.join(projectDir, "switch-projects");
+  await mkdir(switchParent);
+  const secondCreated = await createFigmaSeedProject({
+    workspaceDir: switchParent,
+    projectName: "switch-second",
+  });
+  const thirdCreated = await createFigmaSeedProject({
+    workspaceDir: switchParent,
+    projectName: "switch-third",
+  });
+  const secondSeed = await client.request("tools/call", {
+    name: "open_design_workspace",
+    arguments: { projectDir: secondCreated.projectDir },
+  });
+  const secondWorkspace = secondSeed.structuredContent.workspace;
+  assert.equal(secondWorkspace.phase, "ready", JSON.stringify(secondWorkspace));
+
+  const pollOldWorkspace = async () => {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      await client.request("tools/call", {
+        name: "get_design_workspace_state",
+        arguments: { projectDir: secondWorkspace.projectDir },
+      });
+    }
+  };
+  const thirdSeedPromise = client.request("tools/call", {
+    name: "open_design_workspace",
+    arguments: { projectDir: thirdCreated.projectDir },
+  });
+  const [thirdSeed] = await Promise.all([
+    thirdSeedPromise,
+    pollOldWorkspace(),
+    pollOldWorkspace(),
+    pollOldWorkspace(),
+  ]);
+  const thirdWorkspace = thirdSeed.structuredContent.workspace;
+  assert.equal(thirdWorkspace.phase, "ready", JSON.stringify(thirdWorkspace));
+  assert.equal(thirdWorkspace.bridgeReady, true);
+  assert.doesNotMatch(thirdWorkspace.message, /另一个设计工作台/);
+
+  const bridgeHealth = await fetch(
+    `http://127.0.0.1:${bridgePort}/health`,
+  ).then((response) => response.json());
+  assert.equal(bridgeHealth.projectKey, thirdWorkspace.projectKey);
+  assert.equal(bridgeHealth.projectName, thirdWorkspace.projectName);
 });
 
 test("clears Figma links without closing the active Codex project", async (t) => {
@@ -1098,7 +1226,10 @@ test("reports unsupported Figma changes as pending for a Codex handoff", async (
   );
   await readyPromise;
 
-  const ackPromise = waitForSocketMessage(socket, "page.changes.ack");
+  const firstMessagePromise = waitForAnySocketMessage(socket, [
+    "page.changes.ack",
+    "bridge.error",
+  ]);
   socket.send(
     JSON.stringify({
       type: "page.changes.record",
@@ -1124,7 +1255,8 @@ test("reports unsupported Figma changes as pending for a Codex handoff", async (
       },
     }),
   );
-  const ack = await ackPromise;
+  const ack = await firstMessagePromise;
+  assert.notEqual(ack.type, "bridge.error", ack.error);
   assert.equal(ack.state, "pending");
 
   let state;
@@ -1225,7 +1357,7 @@ test("verifies a protocol 14 reparent in the real preview before clearing pendin
   }));
   await readyPromise;
 
-  const ackPromise = waitForSocketMessage(socket, "page.changes.ack");
+  const verifiedMessagePromise = waitForSocketMessage(socket, "page.changes.ack");
   socket.send(JSON.stringify({
     type: "page.changes.record",
     requestId: "verified-reparent",
@@ -1256,8 +1388,9 @@ test("verifies a protocol 14 reparent in the real preview before clearing pendin
       annotations: [],
     },
   }));
-  const ack = await ackPromise;
+  const ack = await verifiedMessagePromise;
   assert.equal(ack.state, "applied");
+  assert.notEqual(ack.sourceHash, page.sourceHash);
   assert.equal(ack.fastApply.pendingCount, 0);
   assert.equal(ack.fastApply.verification.status, "passed");
   assert.equal(ack.fastApply.verification.checkedNodes, 1);
@@ -1566,12 +1699,21 @@ function expectedRuntimeSource() {
 }
 
 function startClient(environment = {}) {
+  const automaticRegistryPath = environment.CODEX_DESIGN_BRIDGE_PROJECT_REGISTRY
+    ? ""
+    : path.join(
+        os.tmpdir(),
+        `cdb-project-registry-test-${process.pid}-${++clientRegistrySequence}.json`,
+      );
   const child = spawn(process.execPath, [serverPath], {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
     env: {
       ...process.env,
       CODEX_DESIGN_BRIDGE_PORT: "0",
+      ...(automaticRegistryPath
+        ? { CODEX_DESIGN_BRIDGE_PROJECT_REGISTRY: automaticRegistryPath }
+        : {}),
       ...environment,
     },
   });
@@ -1620,9 +1762,12 @@ function startClient(environment = {}) {
       });
     },
     close() {
-      if (child.exitCode !== null) return Promise.resolve();
+      const cleanup = () => automaticRegistryPath
+        ? unlink(automaticRegistryPath).catch(() => {})
+        : Promise.resolve();
+      if (child.exitCode !== null) return cleanup();
       return new Promise((resolve) => {
-        child.once("exit", resolve);
+        child.once("exit", () => cleanup().then(resolve));
         child.stdin.end();
       });
     },
@@ -1641,15 +1786,38 @@ async function getFreePort() {
   return port;
 }
 
-function waitForSocketMessage(socket, type) {
+function waitForSocketMessage(socket, type, timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`Timed out waiting for ${type}.`)),
-      2_000,
+      timeoutMs,
     );
     const onMessage = (raw) => {
       const message = JSON.parse(String(raw));
+      if (type !== "bridge.error" && message.type === "bridge.error") {
+        clearTimeout(timer);
+        socket.off("message", onMessage);
+        reject(new Error(message.error || "Figma bridge error."));
+        return;
+      }
       if (message.type !== type) return;
+      clearTimeout(timer);
+      socket.off("message", onMessage);
+      resolve(message);
+    };
+    socket.on("message", onMessage);
+  });
+}
+
+function waitForAnySocketMessage(socket, types, timeoutMs = 20_000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Timed out waiting for ${types.join(" or ")}.`)),
+      timeoutMs,
+    );
+    const onMessage = (raw) => {
+      const message = JSON.parse(String(raw));
+      if (!types.includes(message.type)) return;
       clearTimeout(timer);
       socket.off("message", onMessage);
       resolve(message);

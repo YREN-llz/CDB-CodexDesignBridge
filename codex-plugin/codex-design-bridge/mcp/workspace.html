@@ -841,10 +841,39 @@
       .project {
         width: min(240px, 28vw);
         margin: 0;
+        padding: 6px 10px;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        background: transparent;
         color: #e7e7eb;
         font-size: 13px;
         font-weight: 650;
         text-align: center;
+        cursor: pointer;
+      }
+
+      .project:hover,
+      .project:focus-visible {
+        border-color: var(--line);
+        background: rgba(255, 255, 255, 0.04);
+        outline: none;
+      }
+
+      .project-label {
+        display: inline-block;
+        max-width: calc(100% - 18px);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: middle;
+        white-space: nowrap;
+      }
+
+      .project-chevron {
+        display: inline-block;
+        margin-left: 5px;
+        color: var(--muted);
+        font-size: 10px;
+        vertical-align: middle;
       }
 
       .toolbar {
@@ -1342,10 +1371,112 @@
 
       dialog { border-radius: 10px; }
 
+      #projectDialog {
+        width: min(640px, calc(100vw - 32px));
+      }
+
+      .project-dialog-header,
+      .launcher-project-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .project-dialog-header h2,
+      .launcher-project-header strong {
+        margin: 0;
+      }
+
+      .project-list {
+        display: grid;
+        gap: 8px;
+        min-height: 44px;
+        margin-top: 14px;
+      }
+
+      .project-list.dialog-list {
+        max-height: min(410px, 55vh);
+        overflow: auto;
+      }
+
+      .project-row {
+        display: grid;
+        min-width: 0;
+        padding: 11px 12px;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0b0b0f;
+      }
+
+      .project-row.active {
+        border-color: rgba(184, 148, 255, 0.42);
+        background: rgba(117, 89, 255, 0.1);
+      }
+
+      .project-copy {
+        min-width: 0;
+      }
+
+      .project-copy strong,
+      .project-copy span {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .project-copy strong {
+        color: var(--text);
+        font-size: 12px;
+      }
+
+      .project-copy span {
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 10px;
+      }
+
+      .project-row-actions {
+        display: flex;
+        gap: 6px;
+      }
+
+      .project-row-actions .button {
+        min-height: 30px;
+        padding: 0 10px;
+        font-size: 11px;
+      }
+
+      .project-row-actions .project-forget {
+        color: var(--muted);
+      }
+
+      .project-empty {
+        margin: 0;
+        padding: 16px;
+        border: 1px dashed var(--line);
+        border-radius: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        text-align: center;
+      }
+
+      .project-status {
+        min-height: 18px;
+        margin-top: 12px !important;
+        font-size: 11px;
+      }
+
       .launcher {
         width: min(760px, calc(100% - 32px));
+        max-height: calc(100vh - 32px);
         margin: auto;
         padding: 32px;
+        overflow: auto;
         border: 1px solid var(--line);
         border-radius: 8px;
         background: var(--surface);
@@ -1354,6 +1485,17 @@
 
       .launcher h1 { margin: 0; font-size: 28px; }
       .launcher > p { margin: 8px 0 24px; color: var(--muted); }
+      .launcher-projects {
+        margin-bottom: 12px;
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0d0d11;
+      }
+      .launcher-projects .project-list {
+        max-height: 178px;
+        overflow: auto;
+      }
       .launcher-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
       .launcher-card {
         min-height: 150px;
@@ -1394,6 +1536,9 @@
         .topbar-left { display: none; }
         .identity { grid-column: 1; justify-self: start; }
         .project { width: 160px; text-align: left; }
+        .launcher-grid { grid-template-columns: 1fr; }
+        .project-row { grid-template-columns: 1fr; }
+        .project-row-actions { justify-content: flex-end; }
         .toolbar { grid-column: 2; }
         .workspace-body { grid-template-columns: 120px minmax(0, 1fr); }
         .page-panel { display: flex; }
@@ -1406,6 +1551,13 @@
       <section class="launcher" id="launcherView" aria-label="CDB 启动器" hidden>
         <h1>CDB</h1>
         <p>从现有 Figma 页面开始，或直接描述要创建的新设计。</p>
+        <section class="launcher-projects" aria-labelledby="launcherProjectsTitle">
+          <div class="launcher-project-header">
+            <strong id="launcherProjectsTitle">项目管理</strong>
+            <button class="button" id="launcherOpenProject" type="button">打开本地项目</button>
+          </div>
+          <div class="project-list" id="launcherProjectList"></div>
+        </section>
         <div class="launcher-grid">
           <div class="launcher-card" id="launcherDropZone" hidden>
             <strong>打开项目</strong>
@@ -1417,14 +1569,14 @@
           </div>
           <div class="launcher-card">
             <strong>从 Figma 开始</strong>
-            <p>创建一个空白页面工作台，再把 Figma 中选中的完整页面 Frame 生成到 Codex。</p>
-            <button class="button" id="launcherFigma" type="button">连接 Figma 页面</button>
+            <p>先在本地选择保存位置，再创建空白工作台并接收 Figma 中选中的完整页面 Frame。</p>
+            <button class="button" id="launcherFigma" type="button">选择位置并连接 Figma</button>
           </div>
           <div class="launcher-card">
             <strong>新建设计</strong>
-            <p>提交后会通过当前 Codex 任务按 CDB 规则创建，不需要选择框架。</p>
+            <p>描述页面后拉起本地文件夹选择器，由 CDB 在所选位置创建独立项目。</p>
             <textarea id="launcherDescription" placeholder="例如：做一个面向独立摄影师的作品集首页"></textarea>
-            <button class="button" id="launcherCreate" type="button">新建设计</button>
+            <button class="button" id="launcherCreate" type="button">选择位置并新建</button>
           </div>
         </div>
         <p class="import-status" id="launcherStatus" aria-live="polite"></p>
@@ -1451,7 +1603,10 @@
           </div>
 
           <div class="identity">
-            <h1 class="project" id="projectName">正在打开项目…</h1>
+            <button class="project" id="projectMenuButton" type="button" title="管理或切换项目">
+              <span class="project-label" id="projectName">正在打开项目…</span>
+              <span class="project-chevron" aria-hidden="true">⌄</span>
+            </button>
           </div>
 
           <div class="toolbar">
@@ -1585,6 +1740,21 @@
       </div>
     </dialog>
 
+    <dialog id="projectDialog" aria-labelledby="projectDialogTitle">
+      <div class="dialog-content">
+        <div class="project-dialog-header">
+          <h2 id="projectDialogTitle">项目管理</h2>
+          <button class="button" id="projectOpenLocalButton" type="button">打开本地项目</button>
+        </div>
+        <p>切换前会重新预检。移出列表不会删除或修改本地项目文件。</p>
+        <div class="project-list dialog-list" id="projectDialogList"></div>
+        <p class="project-status" id="projectDialogStatus" aria-live="polite"></p>
+        <div class="dialog-actions">
+          <button class="button" id="closeProjectDialogButton" type="button">完成</button>
+        </div>
+      </div>
+    </dialog>
+
     <dialog id="importDialog" aria-labelledby="importDialogTitle">
       <div class="dialog-content">
         <h2 id="importDialogTitle">导入 HTML 项目</h2>
@@ -1640,7 +1810,15 @@
           launcherDescription: document.getElementById("launcherDescription"),
           launcherCreate: document.getElementById("launcherCreate"),
           launcherStatus: document.getElementById("launcherStatus"),
+          launcherOpenProject: document.getElementById("launcherOpenProject"),
+          launcherProjectList: document.getElementById("launcherProjectList"),
+          projectMenuButton: document.getElementById("projectMenuButton"),
           projectName: document.getElementById("projectName"),
+          projectDialog: document.getElementById("projectDialog"),
+          projectDialogList: document.getElementById("projectDialogList"),
+          projectDialogStatus: document.getElementById("projectDialogStatus"),
+          projectOpenLocal: document.getElementById("projectOpenLocalButton"),
+          closeProjectDialog: document.getElementById("closeProjectDialogButton"),
           workspaceLabel: document.getElementById("workspaceLabel"),
           connectionPill: document.getElementById("connectionPill"),
           version: document.getElementById("versionLabel"),
@@ -1705,6 +1883,8 @@
         let previewLoadTimer = null;
         let openingHtml = false;
         let importingProject = false;
+        let creatingProject = false;
+        let switchingProject = false;
         const PREVIEW_MIN_ZOOM = 50;
         const PREVIEW_MAX_ZOOM = 300;
         const PREVIEW_PAN_GUTTER = 32;
@@ -1878,14 +2058,7 @@
           elements.htmlInput.click(),
         );
         elements.launcherFigma.addEventListener("click", async () => {
-          if (!state.workspaceDir) return;
-          elements.launcherStatus.textContent = "正在创建 Figma 页面工作台…";
-          const result = await callTool(
-            "create_figma_seed_project",
-            { workspaceDir: state.workspaceDir },
-            { timeoutMs: 120_000 },
-          );
-          if (result) applyToolResult(result);
+          await createLocalProject({ kind: "figma" });
         });
         elements.launcherCreate.addEventListener("click", async () => {
           const description = elements.launcherDescription.value.trim();
@@ -1893,20 +2066,38 @@
             elements.launcherStatus.textContent = "请先描述想创建的页面。";
             return;
           }
-          if (!bridge?.sendFollowUpMessage) {
-            elements.launcherStatus.textContent = "请在当前 Codex 任务中发送这段设计描述。";
-            return;
-          }
-          elements.launcherStatus.textContent = "正在交给当前 Codex 任务…";
-          try {
-            await bridge.sendFollowUpMessage({
-              prompt: `@CDB 新建设计：${description}`,
-            });
-            elements.launcherStatus.textContent = "已提交，CDB 会直接创建并打开设计。";
-          } catch {
-            elements.launcherStatus.textContent = "提交失败，请在当前任务中直接发送设计描述。";
-          }
+          await createLocalProject({ kind: "design", description });
         });
+        elements.launcherOpenProject.addEventListener("click", () =>
+          openLocalProject({ statusElement: elements.launcherStatus }),
+        );
+        elements.projectMenuButton.addEventListener("click", async () => {
+          elements.projectDialogStatus.textContent = "";
+          elements.projectDialog.showModal();
+          await refreshProjectCatalog();
+        });
+        elements.projectOpenLocal.addEventListener("click", () =>
+          openLocalProject({ statusElement: elements.projectDialogStatus }),
+        );
+        elements.closeProjectDialog.addEventListener("click", () =>
+          elements.projectDialog.close(),
+        );
+        for (const projectList of [
+          elements.launcherProjectList,
+          elements.projectDialogList,
+        ]) {
+          projectList.addEventListener("click", async (event) => {
+            const openButton = event.target.closest("[data-project-open]");
+            if (openButton) {
+              await switchRegisteredProject(openButton.dataset.projectOpen);
+              return;
+            }
+            const forgetButton = event.target.closest("[data-project-forget]");
+            if (forgetButton) {
+              await forgetProject(forgetButton.dataset.projectForget);
+            }
+          });
+        }
         elements.importProject.addEventListener("click", () => {
           elements.importStatus.textContent = "";
           elements.importDialog.showModal();
@@ -2032,6 +2223,147 @@
             { timeoutMs: 12_000 },
           );
           if (result) applyToolResult(result);
+        }
+
+        async function createLocalProject({ kind, description = "" }) {
+          if (creatingProject) return;
+          creatingProject = true;
+          elements.launcherStatus.textContent = "请选择本地项目的保存位置…";
+          render();
+          try {
+            const selectionResult = await callTool(
+              "choose_local_project_location",
+              {
+                initialDir: state.workspaceDir || undefined,
+                purpose: kind,
+              },
+              { timeoutMs: 310_000 },
+            );
+            const selection = readLocationSelection(selectionResult);
+            if (!selection) {
+              elements.launcherStatus.textContent =
+                state.message || "没有取得本地保存位置，请重试。";
+              return;
+            }
+            if (!selection.selected) {
+              elements.launcherStatus.textContent = "已取消，没有创建任何文件。";
+              return;
+            }
+
+            elements.launcherStatus.textContent = kind === "figma"
+              ? "正在本地创建 Figma 页面工作台…"
+              : "正在本地创建设计项目并运行预检…";
+            const result = await callTool(
+              kind === "figma"
+                ? "create_figma_seed_project"
+                : "create_design_project",
+              kind === "figma"
+                ? { workspaceDir: selection.path }
+                : {
+                    workspaceDir: selection.path,
+                    description,
+                  },
+              { timeoutMs: 120_000 },
+            );
+            if (result) applyToolResult(result);
+          } finally {
+            creatingProject = false;
+            render();
+          }
+        }
+
+        async function refreshProjectCatalog() {
+          const result = await callTool(
+            "list_design_projects",
+            {},
+            { silent: true, timeoutMs: 8_000 },
+          );
+          const catalog = readProjectCatalog(result);
+          if (!catalog) return;
+          state = { ...state, projectCatalog: catalog };
+          renderProjectCatalog();
+        }
+
+        async function openLocalProject({ statusElement }) {
+          if (switchingProject || !bridge?.callTool) return;
+          switchingProject = true;
+          statusElement.textContent = "请选择 CDB 项目文件夹…";
+          render();
+          try {
+            const selectionResult = await callTool(
+              "choose_local_project_location",
+              {
+                initialDir: state.projectDir || state.workspaceDir || undefined,
+                purpose: "open",
+              },
+              { timeoutMs: 310_000 },
+            );
+            const selection = readLocationSelection(selectionResult);
+            if (!selection?.selected) {
+              statusElement.textContent = selection?.cancelled
+                ? "已取消，没有切换项目。"
+                : "没有取得本地项目目录，请重试。";
+              return;
+            }
+            statusElement.textContent = "正在预检并打开项目…";
+            const result = await callTool(
+              "open_design_workspace",
+              { projectDir: selection.path },
+              { timeoutMs: 120_000 },
+            );
+            if (result) {
+              applyToolResult(result);
+              elements.projectDialog.close();
+            } else {
+              statusElement.textContent = state.message || "项目无法打开，请检查后重试。";
+            }
+          } finally {
+            switchingProject = false;
+            render();
+          }
+        }
+
+        async function switchRegisteredProject(projectKey) {
+          if (!projectKey || switchingProject) return;
+          if (projectKey === state.projectKey) {
+            elements.projectDialog.close();
+            return;
+          }
+          switchingProject = true;
+          elements.projectDialogStatus.textContent = "正在预检并切换项目…";
+          renderProjectCatalog();
+          try {
+            const result = await callTool(
+              "open_registered_design_project",
+              { projectKey },
+              { timeoutMs: 120_000 },
+            );
+            if (result) {
+              applyToolResult(result);
+              elements.projectDialog.close();
+            } else {
+              elements.projectDialogStatus.textContent =
+                state.message || "项目无法切换，请检查后重试。";
+            }
+          } finally {
+            switchingProject = false;
+            render();
+          }
+        }
+
+        async function forgetProject(projectKey) {
+          if (!projectKey || projectKey === state.projectKey || switchingProject) return;
+          const result = await callTool(
+            "forget_design_project",
+            { projectKey },
+            { timeoutMs: 8_000 },
+          );
+          const catalog = readProjectCatalog(result);
+          if (!catalog) return;
+          state = { ...state, projectCatalog: catalog };
+          elements.projectDialogStatus.textContent =
+            "已移出列表；本地项目文件未删除。";
+          renderProjectCatalog();
         }
 
         async function managePage(action, values) {
@@ -2498,19 +2830,28 @@
           const launcherMode = state.mode === "launcher";
           elements.launcher.hidden = !launcherMode;
           elements.workspace.hidden = launcherMode;
+          renderProjectCatalog();
           if (launcherMode) {
             elements.launcherChooseFolder.disabled = importingProject || !state.workspaceDir;
             elements.launcherChooseHtml.disabled = importingProject || !state.workspaceDir;
-            elements.launcherFigma.disabled = !state.workspaceDir;
-            elements.launcherCreate.disabled = !bridge?.sendFollowUpMessage;
+            elements.launcherFigma.disabled = creatingProject || !bridge?.callTool;
+            elements.launcherCreate.disabled = creatingProject || !bridge?.callTool;
+            elements.launcherOpenProject.disabled = switchingProject || !bridge?.callTool;
+            elements.launcherFigma.textContent = creatingProject
+              ? "正在处理…"
+              : "选择位置并连接 Figma";
+            elements.launcherCreate.textContent = creatingProject
+              ? "正在处理…"
+              : "选择位置并新建";
             if (!state.workspaceDir && !elements.launcherStatus.textContent) {
               elements.launcherStatus.textContent =
-                "当前任务没有可写入位置；新建设计仍可交给 Codex 选择工作区。";
+                "新建项目时会拉起本地文件夹选择器。";
             }
             return;
           }
           const busy = isBusy(state.phase);
           elements.projectName.textContent = state.projectName || "Design workspace";
+          elements.projectMenuButton.disabled = switchingProject;
           renderPageList(busy);
           const activePage = (state.pages || []).find(
             (page) => page.id === state.activePageId,
@@ -2673,6 +3014,68 @@
             Array.isArray(state.changedFiles) && state.changedFiles.length
               ? `已修改：${state.changedFiles.join("、")}`
               : "";
+        }
+
+        function renderProjectCatalog() {
+          const projects = Array.isArray(state.projectCatalog)
+            ? state.projectCatalog
+            : [];
+          const markup = projects.length
+            ? projects.map(projectRowMarkup).join("")
+            : '<p class="project-empty">还没有项目记录。新建或打开项目后会自动出现在这里。</p>';
+          elements.launcherProjectList.innerHTML = markup;
+          elements.projectDialogList.innerHTML = markup;
+        }
+
+        function projectRowMarkup(project) {
+          const available = project.status === "available";
+          const active = Boolean(
+            state.projectKey
+              ? project.projectKey === state.projectKey
+              : project.active,
+          );
+          const statusLabel = project.status === "missing"
+            ? "位置失效"
+            : project.status === "identity_changed"
+              ? "项目身份已变化"
+              : active
+                ? "当前项目"
+                : "可切换";
+          const openLabel = active ? "当前" : available ? "打开" : "不可用";
+          return [
+            `<article class="project-row${active ? " active" : ""}">`,
+            '<div class="project-copy">',
+            `<strong>${escapeHtml(project.name || "未命名项目")}</strong>`,
+            `<span title="${escapeHtml(project.projectDir || "")}">${escapeHtml(project.projectDir || "")}</span>`,
+            `<span>${escapeHtml(statusLabel)}${project.lastOpenedAt ? ` · ${escapeHtml(formatProjectTime(project.lastOpenedAt))}` : ""}</span>`,
+            "</div>",
+            '<div class="project-row-actions">',
+            `<button class="button" type="button" data-project-open="${escapeHtml(project.projectKey || "")}"${active || !available || switchingProject ? " disabled" : ""}>${openLabel}</button>`,
+            `<button class="button project-forget" type="button" data-project-forget="${escapeHtml(project.projectKey || "")}"${active || switchingProject ? " disabled" : ""}>移出列表</button>`,
+            "</div>",
+            "</article>",
+          ].join("");
+        }
+
+        function formatProjectTime(value) {
+          const timestamp = Date.parse(value);
+          if (!Number.isFinite(timestamp)) return "";
+          return new Intl.DateTimeFormat("zh-CN", {
+            month: "numeric",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+          }).format(new Date(timestamp));
+        }
+
+        function escapeHtml(value) {
+          return String(value || "").replace(/[&<>"']/g, (character) => ({
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            '"': "&quot;",
+            "'": "&#039;",
+          })[character]);
         }
 
         function renderPageList(busy) {
@@ -2939,6 +3342,25 @@
           );
         }
 
+        function readLocationSelection(value) {
+          return (
+            value?.structuredContent?.locationSelection ||
+            value?._meta?.locationSelection ||
+            value?.locationSelection ||
+            null
+          );
+        }
+
+        function readProjectCatalog(value) {
+          const catalog =
+            value?.structuredContent?.projectCatalog ||
+            value?._meta?.projectCatalog ||
+            value?.projectCatalog;
+          return Array.isArray(catalog)
+            ? catalog.map((project) => ({ ...project }))
+            : null;
+        }
+
         function readPreviewImage(value) {
           return (
             value?.structuredContent?.previewImage ||
@@ -2976,6 +3398,8 @@
             versionStatus: demo ? "current" : "",
             versionMessage: "",
             projectDir: "",
+            projectKey: "",
+            projectCatalog: [],
             pages: demo
               ? [
                   {

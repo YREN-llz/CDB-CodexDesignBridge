@@ -261,6 +261,24 @@ test("publishes manifest pages and accepts page-list import requests", async (t)
     onImportPages: async (pageIds) => importedRequests.push(pageIds),
     onResetWorkspace: async () => {
       resetCount += 1;
+      return [
+        {
+          id: "home",
+          name: "Home",
+          entry: "index.html",
+          route: "/",
+          sourceHash: "home-hash",
+          syncState: "not_imported",
+        },
+        {
+          id: "settings",
+          name: "Settings",
+          entry: "index.html",
+          route: "/settings",
+          sourceHash: "settings-hash",
+          syncState: "not_imported",
+        },
+      ];
     },
   });
   bridge.setPageCatalog([
@@ -334,9 +352,218 @@ test("publishes manifest pages and accepts page-list import requests", async (t)
   socket.send(JSON.stringify({ type: "workspace.reset.request" }));
   const reset = await inbox.next("workspace.reset.result");
   assert.equal(reset.ok, true);
+  assert.equal(reset.pages.length, 2);
+  assert.ok(reset.pages.every((page) => page.state === "not_imported"));
   assert.equal(resetCount, 1);
   assert.equal(bridge.status().unsentChanges, false);
-  assert.deepEqual(bridge.status().pageStates, []);
+  assert.equal(bridge.status().pageStates.length, 2);
+  assert.ok(
+    bridge.status().pageStates.every((page) => page.state === "not_imported"),
+  );
+});
+
+test("lists, validates, switches, and creates managed projects from Figma", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "local-figma-projects-"));
+  const opened = [];
+  const created = [];
+  const bridge = new LocalFigmaBridge(projectDir, {
+    port: 0,
+    projectName: "Current project",
+    projectKey: "current-key",
+    onListProjects: async () => [
+      {
+        projectKey: "current-key",
+        name: "Current project",
+        projectDir,
+        status: "available",
+        active: true,
+      },
+      {
+        projectKey: "other-key",
+        name: "Other project",
+        projectDir: path.join(projectDir, "other"),
+        status: "available",
+        active: false,
+      },
+      {
+        projectKey: "missing-key",
+        name: "Missing project",
+        projectDir: path.join(projectDir, "missing"),
+        status: "missing",
+        active: false,
+      },
+    ],
+    onOpenProject: async (projectKey) => opened.push(projectKey),
+    onCreateFigmaProject: async ({ projectName }) => {
+      created.push(projectName);
+      return {
+        projectKey: "created-key",
+        projectDir: path.join(projectDir, "created"),
+        start: () => created.push("started"),
+      };
+    },
+  });
+  await bridge.start();
+  t.after(async () => {
+    await bridge.stop();
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const pairing = await fetch(`http://localhost:${bridge.status().port}/api/pair`, {
+    headers: { origin: "https://www.figma.com" },
+  }).then((response) => response.json());
+  const socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  const inbox = messageInbox(socket);
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  t.after(() => socket.close());
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    protocolVersion: 14,
+    pluginVersion: "",
+  }));
+  const ready = await inbox.next("plugin.ready");
+  assert.equal(ready.projectDir, path.resolve(projectDir));
+  await inbox.next("page.catalog");
+
+  socket.send(JSON.stringify({ type: "project.catalog.request" }));
+  const catalog = await inbox.next("project.catalog");
+  assert.equal(catalog.projects.length, 3);
+  assert.equal(catalog.activeProjectKey, "current-key");
+
+  socket.send(JSON.stringify({ type: "project.open.request", projectKey: "missing-key" }));
+  const missing = await inbox.next("project.action.result");
+  assert.equal(missing.ok, false);
+  assert.deepEqual(opened, []);
+
+  socket.send(JSON.stringify({ type: "project.open.request", projectKey: "other-key" }));
+  const switched = await inbox.next("project.action.result");
+  assert.equal(switched.ok, true);
+  assert.equal(switched.reconnecting, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(opened, ["other-key"]);
+
+  socket.send(JSON.stringify({ type: "project.create.request", projectName: "From Figma" }));
+  const createResult = await inbox.next("project.action.result");
+  assert.equal(createResult.ok, true);
+  assert.equal(createResult.projectKey, "created-key");
+  assert.deepEqual(created, ["From Figma", "started"]);
+});
+
+test("restores persisted page mappings after the bridge restarts", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "local-figma-restart-"));
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<link rel="stylesheet" href="./styles.css"><h1 data-codex-id="headline">Before</h1>',
+    "utf8",
+  );
+  await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
+
+  const first = new LocalFigmaBridge(projectDir, { port: 0 });
+  first.setPageCatalog([{ id: "local-preview", name: "Local", sourceHash: "project-v1" }]);
+  await first.start();
+  const pairing = await (
+    await fetch(`http://localhost:${first.status().port}/api/pair`, {
+      headers: { origin: "https://www.figma.com" },
+    })
+  ).json();
+  const socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  const inbox = messageInbox(socket);
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    protocolVersion: 13,
+    importedAssetIds: [],
+    importedPageIds: [],
+  }));
+  await inbox.next("plugin.ready");
+  const importPromise = first.pushPage(sampleManifest());
+  const upsert = await inbox.next("page.upsert");
+  socket.send(JSON.stringify({
+    type: "page.import.result",
+    result: { ok: true, pageId: "local-preview", nodes: upsert.page.nodeIds.length },
+  }));
+  await importPromise;
+  socket.close();
+  await first.stop();
+
+  const stored = JSON.parse(
+    await readFile(
+      path.join(projectDir, ".figma-sync", "page-baselines", "local-preview.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(stored.projectSourceHash, "project-v1");
+  assert.equal(stored.manifest.pageId, "local-preview");
+
+  let preparedContext = null;
+  const second = new LocalFigmaBridge(projectDir, {
+    port: 0,
+    onPrepareApply: async (context) => {
+      preparedContext = context;
+      return { currentManifest: sampleManifest() };
+    },
+  });
+  second.setPageCatalog([{ id: "local-preview", name: "Local", sourceHash: "project-v1" }]);
+  await second.start();
+  t.after(() => second.stop());
+  const secondPairing = await (
+    await fetch(`http://localhost:${second.status().port}/api/pair`, {
+      headers: { origin: "https://www.figma.com" },
+    })
+  ).json();
+  const secondSocket = new WebSocket(
+    `${secondPairing.wsUrl}?token=${secondPairing.token}`,
+    { origin: "https://www.figma.com" },
+  );
+  const secondInbox = messageInbox(secondSocket);
+  await new Promise((resolve, reject) => {
+    secondSocket.once("open", resolve);
+    secondSocket.once("error", reject);
+  });
+  t.after(() => secondSocket.close());
+  secondSocket.send(JSON.stringify({
+    type: "plugin.hello",
+    protocolVersion: 13,
+    importedAssetIds: [],
+    importedPageIds: ["local-preview"],
+  }));
+  await secondInbox.next("plugin.ready");
+  secondSocket.send(JSON.stringify({
+    type: "page.changes.record",
+    requestId: "restart-request",
+    changeSet: {
+      changeSetId: "restart-change",
+      pageId: "local-preview",
+      sourceHash: upsert.page.sourceHash,
+      changes: [{
+        nodeId: "headline",
+        category: "text",
+        property: "characters",
+        from: "Before",
+        to: "After restart",
+        sourceRef: { selector: '[data-codex-id="headline"]' },
+      }],
+      annotations: [],
+    },
+  }));
+  const accepted = await secondInbox.next("page.changes.ack");
+  assert.equal(accepted.state, "applied");
+  assert.equal(preparedContext.manifest.pageId, "local-preview");
+  assert.match(
+    await readFile(path.join(projectDir, "index.html"), "utf8"),
+    /After restart/,
+  );
 });
 
 test("accepts a Figma-first page without importing a Codex page first", async (t) => {
@@ -426,6 +653,286 @@ test("accepts a Figma-first page without importing a Codex page first", async (t
   const source = await readFile(path.join(projectDir, "index.html"), "utf8");
   assert.match(source, /data-codex-root data-codex-id="page-root"/);
   assert.doesNotMatch(source, /figma-seed-placeholder/);
+});
+
+test("keeps an unseeded Figma page isolated from ordinary changes", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "local-figma-gate-"));
+  const original = '<main data-codex-root data-codex-id="page-root"><p data-codex-id="figma-seed-placeholder">Waiting</p></main>';
+  await writeFile(path.join(projectDir, "index.html"), original, "utf8");
+  await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
+  const bridge = new LocalFigmaBridge(projectDir, { port: 0 });
+  bridge.setPageCatalog([{
+    id: "new-project-home",
+    name: "Page",
+    entry: "index.html",
+    route: "/",
+    sourceHash: "seed-hash-before",
+    syncState: "not_imported",
+    acceptsFigmaSeed: true,
+  }]);
+  await bridge.start();
+  t.after(async () => {
+    await bridge.stop();
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const pairing = await fetch(`http://localhost:${bridge.status().port}/api/pair`, {
+    headers: { origin: "https://www.figma.com" },
+  }).then((response) => response.json());
+  const socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  const inbox = messageInbox(socket);
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  t.after(() => socket.close());
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    protocolVersion: 14,
+    changedPageIds: ["new-project-home"],
+  }));
+  await inbox.next("plugin.ready");
+  const catalog = await inbox.next("page.catalog");
+  assert.equal(catalog.pages[0].state, "not_imported");
+
+  socket.send(JSON.stringify({
+    type: "page.changes.record",
+    requestId: "ordinary-before-seed",
+    changeSet: {
+      changeSetId: "ordinary-before-seed",
+      pageId: "new-project-home",
+      sourceHash: "seed-hash-before",
+      changes: [{ nodeId: "foreign-node", property: "fill", to: "#123F33" }],
+      annotations: [],
+    },
+  }));
+  const rejected = await inbox.next("bridge.error");
+  assert.match(rejected.error, /完整生成/);
+  assert.equal(bridge.status().pageStates[0].state, "not_imported");
+  assert.equal(await readFile(path.join(projectDir, "index.html"), "utf8"), original);
+  assert.equal(await readFile(path.join(projectDir, "styles.css"), "utf8"), "");
+});
+
+test("reassembles a Figma-first page over 200 nodes and applies it atomically", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "local-large-figma-seed-"));
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<link rel="stylesheet" href="./styles.css"><main data-codex-root data-codex-id="page-root"><p data-codex-id="figma-seed-placeholder">Waiting</p></main>',
+    "utf8",
+  );
+  await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
+  let fastApplyCalls = 0;
+  const bridge = new LocalFigmaBridge(projectDir, {
+    port: 0,
+    onFastApply: async () => {
+      fastApplyCalls += 1;
+      return { sourceHash: "large-seed-hash-after" };
+    },
+  });
+  bridge.setPageCatalog([{
+    id: "large-seed-page",
+    name: "Large page",
+    entry: "index.html",
+    route: "/",
+    sourceHash: "large-seed-hash-before",
+    syncState: "not_imported",
+    acceptsFigmaSeed: true,
+  }]);
+  await bridge.start();
+  t.after(async () => {
+    await bridge.stop();
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const pairing = await fetch(`http://localhost:${bridge.status().port}/api/pair`, {
+    headers: { origin: "https://www.figma.com" },
+  }).then((response) => response.json());
+  const socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  const inbox = messageInbox(socket);
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  t.after(() => socket.close());
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    protocolVersion: 14,
+    importedAssetIds: [],
+    importedPageIds: [],
+  }));
+  const ready = await inbox.next("plugin.ready");
+  assert.equal(ready.pageSeedTransportVersion, 1);
+  await inbox.next("page.catalog");
+
+  const frameDefinition = (id, name) => ({
+    id,
+    type: "frame",
+    tag: id === "page-root" ? "main" : "div",
+    name,
+    width: id === "page-root" ? 1440 : 320,
+    height: id === "page-root" ? 4000 : 80,
+    opacity: 1,
+    visible: true,
+    rotation: 0,
+    style: {
+      fill: { color: "#FFFFFF", opacity: 1 },
+      stroke: null,
+      strokeWeight: 0,
+      cornerRadius: 0,
+    },
+    layout: {
+      mode: id === "page-root" ? "VERTICAL" : "NONE",
+      itemSpacing: 0,
+      padding: { top: 0, right: 0, bottom: 0, left: 0 },
+      primaryAxisAlignItems: "MIN",
+      counterAxisAlignItems: "MIN",
+    },
+    children: [],
+  });
+  const records = [{
+    parentId: null,
+    index: 0,
+    node: frameDefinition("page-root", "Large page"),
+  }];
+  for (let index = 0; index < 250; index += 1) {
+    records.push({
+      parentId: "page-root",
+      index,
+      node: frameDefinition(`figma-node-card-${index}`, `Card ${index}`),
+    });
+  }
+  socket.send(JSON.stringify({
+    type: "page.seed.begin",
+    transportVersion: 1,
+    requestId: "large-seed-request",
+    changeSetId: "large-seed-change",
+    pageId: "large-seed-page",
+    sourceHash: "large-seed-hash-before",
+    nodeCount: records.length,
+    chunkCount: 3,
+    rootNodeType: "FRAME",
+    rootNodeName: "Large page",
+    figma: { pageName: "Figma source", rootNodeId: "1:1", rootNodeName: "Large page" },
+  }));
+  for (let index = 0; index < 3; index += 1) {
+    socket.send(JSON.stringify({
+      type: "page.seed.chunk",
+      transportVersion: 1,
+      requestId: "large-seed-request",
+      changeSetId: "large-seed-change",
+      index,
+      records: records.slice(index * 100, (index + 1) * 100),
+    }));
+  }
+  socket.send(JSON.stringify({
+    type: "page.seed.complete",
+    transportVersion: 1,
+    requestId: "large-seed-request",
+    changeSetId: "large-seed-change",
+  }));
+
+  const accepted = await inbox.next("page.changes.ack");
+  assert.equal(accepted.state, "applied");
+  assert.equal(accepted.sourceHash, "large-seed-hash-after");
+  assert.equal(fastApplyCalls, 1);
+  const source = await readFile(path.join(projectDir, "index.html"), "utf8");
+  assert.match(source, /data-codex-id="figma-node-card-249"/);
+  assert.doesNotMatch(source, /figma-seed-placeholder/);
+});
+
+test("rejects an incomplete page seed without changing source", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "local-broken-figma-seed-"));
+  const original = '<main data-codex-root data-codex-id="page-root"><p data-codex-id="figma-seed-placeholder">Waiting</p></main>';
+  await writeFile(path.join(projectDir, "index.html"), original, "utf8");
+  await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
+  const bridge = new LocalFigmaBridge(projectDir, { port: 0 });
+  bridge.setPageCatalog([{
+    id: "broken-seed-page",
+    name: "Broken page",
+    entry: "index.html",
+    route: "/",
+    sourceHash: "broken-seed-hash",
+    syncState: "not_imported",
+    acceptsFigmaSeed: true,
+  }]);
+  await bridge.start();
+  t.after(async () => {
+    await bridge.stop();
+    await rm(projectDir, { recursive: true, force: true });
+  });
+  const pairing = await fetch(`http://localhost:${bridge.status().port}/api/pair`, {
+    headers: { origin: "https://www.figma.com" },
+  }).then((response) => response.json());
+  const socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  const inbox = messageInbox(socket);
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  t.after(() => socket.close());
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    protocolVersion: 14,
+    importedAssetIds: [],
+    importedPageIds: [],
+  }));
+  await inbox.next("plugin.ready");
+  await inbox.next("page.catalog");
+  socket.send(JSON.stringify({
+    type: "page.seed.begin",
+    transportVersion: 1,
+    requestId: "broken-seed-request",
+    changeSetId: "broken-seed-change",
+    pageId: "broken-seed-page",
+    sourceHash: "broken-seed-hash",
+    nodeCount: 2,
+    chunkCount: 2,
+    rootNodeType: "FRAME",
+    rootNodeName: "Broken page",
+  }));
+  socket.send(JSON.stringify({
+    type: "page.seed.chunk",
+    transportVersion: 1,
+    requestId: "broken-seed-request",
+    changeSetId: "broken-seed-change",
+    index: 0,
+    records: [{
+      parentId: null,
+      index: 0,
+      node: {
+        id: "page-root",
+        type: "frame",
+        tag: "main",
+        name: "Broken page",
+        width: 390,
+        height: 844,
+        opacity: 1,
+        visible: true,
+        rotation: 0,
+        style: { fill: null, stroke: null, strokeWeight: 0, cornerRadius: 0 },
+        layout: { mode: "NONE" },
+        children: [],
+      },
+    }],
+  }));
+  socket.send(JSON.stringify({
+    type: "page.seed.complete",
+    transportVersion: 1,
+    requestId: "broken-seed-request",
+    changeSetId: "broken-seed-change",
+  }));
+
+  const rejected = await inbox.next("page.seed.result");
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /不完整/);
+  assert.equal(await readFile(path.join(projectDir, "index.html"), "utf8"), original);
+  assert.equal(bridge.status().pageStates[0].state, "not_imported");
 });
 
 function messageInbox(socket) {

@@ -156,6 +156,78 @@ test("captures adjacent inline SVGs as editable SVG nodes", async (t) => {
   assert.match(stars[1].svg, /fill="#FF0000"/);
 });
 
+test("marks grid, auto-margin flex, and positioned descendants for coordinate preservation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-layout-fidelity-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    path.join(root, "index.html"),
+    [
+      "<!doctype html>",
+      "<style>",
+      "  main { width: 600px; height: 500px; display: flex; flex-direction: column; }",
+      "  nav { height: 80px; position: relative; }",
+      "  nav > button { position: absolute; right: 16px; top: 12px; }",
+      "  footer { height: 40px; margin-top: auto; }",
+      "  section { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; }",
+      "</style>",
+      '<main data-codex-root data-codex-id="layout-root">',
+      '  <nav data-codex-id="layout-nav">Navigation<button data-codex-id="layout-action">Action</button></nav>',
+      '  <section data-codex-id="layout-grid"><div data-codex-id="grid-a">A</div><div data-codex-id="grid-b">B</div></section>',
+      '  <footer data-codex-id="layout-footer">Footer</footer>',
+      "</main>",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const preview = await startProjectPreview({ rootDirectory: root });
+  t.after(() => preview.stop());
+  const captured = await captureLocalPreview({
+    previewUrl: preview.url,
+    projectDir: root,
+    width: 600,
+    height: 500,
+  });
+  const layoutRoot = captured.manifest.root;
+  const grid = findNode(layoutRoot, "layout-grid");
+  const nav = findNode(layoutRoot, "layout-nav");
+  const action = findNode(layoutRoot, "layout-action");
+
+  assert.equal(layoutRoot.height, 500);
+  assert.equal(layoutRoot.layout.preservePositions, true);
+  assert.equal(grid.layout.preservePositions, true);
+  assert.equal(nav.layout.preservePositions, true);
+  assert.equal(action.layoutItem.positioning, "absolute");
+  assert.ok(action.x > 0);
+});
+
+test("honors the requested page viewport during editable capture", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-page-viewport-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    path.join(root, "index.html"),
+    [
+      "<!doctype html>",
+      "<style>html,body,main{margin:0;width:100%;min-height:100vh}section{height:1400px}</style>",
+      '<main data-codex-root data-codex-id="viewport-root"><section data-codex-id="long-content"></section></main>',
+    ].join("\n"),
+    "utf8",
+  );
+
+  const preview = await startProjectPreview({ rootDirectory: root });
+  t.after(() => preview.stop());
+  const captured = await captureLocalPreview({
+    previewUrl: preview.url,
+    projectDir: root,
+    width: 1280,
+    height: 960,
+  });
+
+  assert.equal(captured.manifest.root.width, 1280);
+  assert.equal(captured.manifest.root.height, 960);
+  assert.equal(captured.manifest.root.clipsContent, true);
+  assert.equal(findNode(captured.manifest.root, "long-content").height, 1400);
+});
+
 test("activates a declared static tab state before capture", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "bridge-tab-state-capture-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -209,6 +281,13 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
       "  .icon path { fill: none; stroke: currentColor; stroke-width: 2px; stroke-linecap: round; }",
       "  .linear { width: 180px; height: 96px; background: linear-gradient(135deg, #7262ff, #4e3fe0); box-shadow: 0 12px 25px rgba(86, 70, 225, .24); }",
       "  .radial { width: 80px; height: 80px; background: radial-gradient(circle at 55% 35%, #f4a95e 0 27%, transparent 28%), linear-gradient(160deg, #db4f62 0 55%, #6c1e55 56%); }",
+      "  .conic { position: relative; width: 64px; height: 64px; background: conic-gradient(from 30deg at 40% 60%, #7262ff 0 72%, #ded9f4 72% 100%); border-radius: 50%; }",
+      "  .conic::before { content: ''; position: absolute; width: 48px; height: 48px; inset: 50% auto auto 50%; transform: translate(-50%, -50%); background: #fff; border-radius: 50%; }",
+      "  .conic-default { width: 32px; height: 32px; background: conic-gradient(#111 0 25%, #eee 25% 100%); }",
+      "  .pseudo-shell { position: relative; width: 120px; height: 48px; }",
+      "  .pseudo-host { margin-left: 30px; width: 38px; height: 38px; }",
+      "  .pseudo-host::before { content: ''; position: absolute; left: 44px; top: 7px; width: 20px; height: 20px; background: #222; }",
+      "  .symbol { display: inline-block; font: 600 16px/20px Inter, sans-serif; }",
       "  .rotated { width: 25px; height: 95px; background: #f7d8bd; transform: rotate(26deg); }",
       "  .grid { width: 120px; height: 80px; background: linear-gradient(rgba(10, 20, 30, .2) 1px, transparent 1px), linear-gradient(90deg, rgba(10, 20, 30, .2) 1px, transparent 1px); background-size: 20px 20px; }",
       "  .glass { width: 180px; height: 64px; border-top: 1px solid rgba(48, 50, 43, .5); background: rgba(255, 255, 255, .72); backdrop-filter: blur(22px); }",
@@ -218,6 +297,10 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
       '  <svg class="icon" data-codex-id="toolbar-icon" viewBox="0 0 24 24"><path d="M4 12h16"/></svg>',
       '  <div class="linear" data-codex-id="linear-card"></div>',
       '  <div class="radial" data-codex-id="radial-art"></div>',
+      '  <div class="conic" data-codex-id="conic-art"></div>',
+      '  <div class="conic-default" data-codex-id="conic-default"></div>',
+      '  <div class="pseudo-shell" data-codex-id="pseudo-shell"><div class="pseudo-host" data-codex-id="pseudo-host"></div></div>',
+      '  <span class="symbol" data-codex-id="symbol-label">⚙</span>',
       '  <div class="rotated" data-codex-id="rotated-art"></div>',
       '  <div class="grid" data-codex-id="grid-art"></div>',
       '  <div class="glass" data-codex-id="glass-dock"></div>',
@@ -237,6 +320,10 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
   const icon = nodes.get("toolbar-icon");
   const linear = nodes.get("linear-card");
   const radial = nodes.get("radial-art");
+  const conic = nodes.get("conic-art");
+  const conicDefault = nodes.get("conic-default");
+  const pseudoShell = nodes.get("pseudo-shell");
+  const symbol = nodes.get("symbol-label");
   const rotated = nodes.get("rotated-art");
   const grid = nodes.get("grid-art");
   const glass = nodes.get("glass-dock");
@@ -262,6 +349,22 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
     "radial-gradient",
     "linear-gradient",
   ]);
+  assert.equal(conic.style.fills[0].type, "conic-gradient");
+  assert.equal(conic.style.fills[0].angle, 30);
+  assert.equal(conicDefault.style.fills[0].angle, 0);
+  assert.deepEqual(conic.style.fills[0].center, { x: 0.4, y: 0.6 });
+  assert.deepEqual(
+    conic.style.fills[0].stops.map((stop) => stop.position),
+    [0, 0.72, 0.72, 1],
+  );
+  assert.equal(findNode(conic, "conic-art-before").x, 8);
+  assert.equal(findNode(conic, "conic-art-before").y, 8);
+  const pseudoHost = findNode(pseudoShell, "pseudo-host");
+  assert.equal(findNode(pseudoHost, "pseudo-host-before").x, 14);
+  assert.equal(findNode(pseudoHost, "pseudo-host-before").y, 7);
+  assert.equal(symbol.font.style, "Regular");
+  assert.ok(Array.isArray(symbol.font.fallbacks));
+  assert.ok(symbol.font.fallbacks.length > 0);
   assert.equal(rotated.rotation, 26);
   assert.equal(rotated.width, 25);
   assert.equal(rotated.height, 95);

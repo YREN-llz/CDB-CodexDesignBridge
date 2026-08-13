@@ -60,13 +60,63 @@ test("creates a preflight-ready Figma seed project", async (t) => {
     await readFile(path.join(created.projectDir, ".cdb", "manifest.json"), "utf8"),
   );
   assert.equal(manifest.source.kind, "figma-seed");
+  assert.equal(manifest.name, "from-figma");
+  assert.equal(manifest.pages[0].id, "from-figma-home");
   const report = await preflightDesignProject(created.projectDir);
   assert.equal(report.status, "pass", JSON.stringify(report.issues));
   assert.equal(report.pages.length, 1);
+  assert.equal(report.pages[0].acceptsFigmaSeed, true);
   assert.match(
     await readFile(path.join(created.projectDir, "index.html"), "utf8"),
     /data-codex-root data-codex-id="page-root"/,
   );
+
+  const second = await createFigmaSeedProject({
+    workspaceDir,
+    projectName: "from-figma",
+  });
+  const secondManifest = JSON.parse(
+    await readFile(path.join(second.projectDir, ".cdb", "manifest.json"), "utf8"),
+  );
+  assert.equal(secondManifest.pages[0].id, "from-figma-2-home");
+  assert.notEqual(secondManifest.pages[0].id, manifest.pages[0].id);
+});
+
+test("page source hashes include referenced local assets", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "cdb-source-hash-"));
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+  await mkdir(path.join(projectDir, ".cdb"));
+  await writeFile(
+    path.join(projectDir, ".cdb", "manifest.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      projectId: "hash-test",
+      name: "Hash test",
+      source: { kind: "static-html", root: "." },
+      entry: "index.html",
+      pages: [{
+        id: "home",
+        name: "Home",
+        entry: "index.html",
+        route: "/",
+        captureRoot: "[data-codex-root]",
+        viewport: { width: 1440, height: 900 },
+      }],
+      assets: { roots: ["assets"], allowRemote: false },
+      mapping: { attribute: "data-codex-id", requireUnique: true },
+      runtime: { dom: "static", spa: false },
+    }),
+  );
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<link rel="stylesheet" href="./styles.css"><main data-codex-root data-codex-id="page-root">Ready</main>',
+  );
+  await writeFile(path.join(projectDir, "styles.css"), "body { color: red; }");
+  const before = await preflightDesignProject(projectDir);
+  await writeFile(path.join(projectDir, "styles.css"), "body { color: blue; }");
+  const after = await preflightDesignProject(projectDir);
+  assert.notEqual(after.pages[0].sourceHash, before.pages[0].sourceHash);
+  assert.notEqual(after.sourceHash, before.sourceHash);
 });
 
 test("applies only report-bound safe fixes and rejects stale plans", async (t) => {

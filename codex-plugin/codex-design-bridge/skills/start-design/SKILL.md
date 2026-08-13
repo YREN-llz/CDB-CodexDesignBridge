@@ -17,6 +17,7 @@ When the user sends only `@CDB`, calls CDB without another instruction, or asks 
 4. Do not recursively scan project files, create a draft, or open an external browser.
 
 The launcher focuses on starting from Figma or a new-design description. Local HTML upload remains an internal capability but is hidden from the normal interface.
+The launcher also shows the persistent CDB project list. This list contains only projects the user explicitly created or opened; never populate it by recursively scanning local disks or workspaces.
 
 ## Open a project
 
@@ -28,6 +29,7 @@ When the user says `@CDB 打开项目` or otherwise explicitly asks to open an e
 4. If preflight reports safe fixes, let the embedded workspace show and apply them. Do not bypass blockers.
 
 Only inspect `.cdb/manifest.json`, root HTML entries, or a user-selected directory. Do not recursively search unrelated workspace folders.
+The embedded project switcher may call `list_design_projects`, `open_registered_design_project`, and `forget_design_project`. Opening a registered project must still rerun unified preflight. Forgetting a project removes only the registry entry and must never delete or modify project files.
 
 ## Create a new design
 
@@ -39,6 +41,7 @@ When the user says `@CDB 新建设计：<描述>` or gives an equivalent descrip
 4. If no writable workspace exists, ask only for a save location.
 
 When the user asks to create a design but gives no description, call `open_design_launcher`; its new-design form continues through the current task.
+The launcher's create actions must open the native local folder picker first. Cancelling the picker creates nothing; after selection, the existing transactional project creator runs in the chosen parent directory.
 
 ## Start from Figma
 
