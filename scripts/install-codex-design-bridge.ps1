@@ -15,6 +15,12 @@ $ErrorActionPreference = "Stop"
 $pluginName = "codex-design-bridge"
 $pluginSelector = "$pluginName@$Marketplace"
 $profileDirectory = [Environment]::GetFolderPath("UserProfile")
+if (-not $profileDirectory) {
+  $profileDirectory = $env:USERPROFILE
+}
+if (-not $profileDirectory) {
+  throw "The user profile directory could not be resolved."
+}
 $scriptDirectory = Split-Path -Parent $PSCommandPath
 $packageRoot = Split-Path -Parent $scriptDirectory
 $coreFiles = @(
@@ -22,8 +28,11 @@ $coreFiles = @(
   ".mcp.json",
   "assets\icon.png",
   "mcp\browser-capture.mjs",
+  "mcp\local-directory-picker.mjs",
+  "mcp\project-registry.mjs",
   "mcp\workspace.html",
   "mcp\server.mjs",
+  "mcp\page-change-compare.mjs",
   "mcp\fast-page-patch.mjs",
   "mcp\local-figma-bridge.mjs",
   "mcp\patch-transaction.mjs",

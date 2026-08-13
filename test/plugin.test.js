@@ -30,9 +30,13 @@ test("development manifest and UI use Figma-compatible localhost URLs", async ()
   assert.match(ui, /发送修改给 Codex/);
   assert.match(ui, /http:\/\/localhost:9847\/api\/pair/);
   assert.match(ui, /ws:\/\/localhost:9847\/ws/);
-  assert.equal(ui.match(/<button\b/g)?.length, 3);
-  assert.match(ui, /用选中稿创建页面/);
+  assert.equal(ui.match(/<button\b/g)?.length, 7);
+  assert.match(ui, /Figma → Codex/);
+  assert.match(ui, /Codex → Figma/);
   assert.match(ui, /id="reset-workspace"/);
+  assert.match(ui, /清除关联/);
+  assert.match(ui, /id="manage-projects"/);
+  assert.match(ui, /项目数据保存在列表显示的本地目录中/);
   assert.match(ui, /Codex 项目、源码和 Figma 画布内容都会保持原样/);
   assert.doesNotMatch(ui, /<h1\b/);
   assert.doesNotMatch(ui, /在 Figma 中调整细节/);
@@ -64,6 +68,7 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
     [
       "capture",
       "seed-page",
+      "import-page",
       "status-dot",
       "status-text",
       "status-detail",
@@ -71,6 +76,13 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
       "catalog-list",
       "catalog-count",
       "reset-workspace",
+      "manage-projects",
+      "project-dialog",
+      "project-list",
+      "project-status",
+      "create-project",
+      "close-projects",
+      "project-path",
       "page-count",
       "asset-count",
       "feedback-count",
@@ -96,7 +108,7 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
     }
   }
 
-  const window = { confirm: () => true };
+  const window = { confirm: () => true, prompt: () => "Figma Design" };
   vm.runInNewContext(script, {
     document: {
       getElementById(id) {
@@ -165,6 +177,8 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
     data: JSON.stringify({
       type: "plugin.ready",
       projectName: "frontend",
+      projectKey: "frontend-project-key",
+      projectDir: "C:\\projects\\frontend",
       localWorkspace: true,
     }),
   });
@@ -172,6 +186,28 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
     elements.get("capture").textContent,
     "发送修改给 Codex",
   );
+  assert.equal(elements.get("project-path").textContent, "C:\\projects\\frontend");
+  assert.equal(elements.get("manage-projects").disabled, false);
+  elements.get("manage-projects").dispatch("click");
+  assert.equal(elements.get("project-dialog").open, true);
+  assert.equal(JSON.parse(sockets[0].lastSent).type, "project.catalog.request");
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "project.catalog",
+      projects: [{
+        projectKey: "frontend-project-key",
+        name: "frontend",
+        projectDir: "C:\\projects\\frontend",
+        status: "available",
+      }, {
+        projectKey: "other-project-key",
+        name: "other",
+        projectDir: "C:\\projects\\other",
+        status: "available",
+      }],
+    }),
+  });
+  assert.equal(elements.get("project-list").children.length, 2);
   sockets[0].onmessage({
     data: JSON.stringify({
       type: "page.catalog",
@@ -231,10 +267,93 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
   assert.equal(elements.get("status-text").textContent, "已更新 2 处修改");
   assert.equal(elements.get("status-detail").textContent, "Codex 页面代码已经保存");
   assert.match(elements.get("result").textContent, /src\/App\.css · 0\.2 秒/);
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "page.catalog",
+      pages: [{
+        id: "figma-seed-page",
+        name: "Figma seed",
+        entry: "index.html",
+        route: "/",
+        state: "not_imported",
+        acceptsFigmaSeed: true,
+        sourceHash: "seed-hash",
+      }],
+    }),
+  });
+  assert.equal(elements.get("seed-page").hidden, false);
+  assert.equal(elements.get("import-page").hidden, false);
+  elements.get("import-page").dispatch("click");
+  assert.equal(
+    elements.get("status-text").textContent,
+    "正在把 Codex 页面发送到 Figma…",
+  );
+  assert.equal(elements.get("seed-page").disabled, true);
+  assert.equal(elements.get("import-page").disabled, true);
+  assert.equal(elements.get("import-page").textContent, "发送中…");
+  assert.deepEqual(JSON.parse(sockets[0].lastSent), {
+    type: "page.import.request",
+    pageIds: ["figma-seed-page"],
+  });
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "page.import.request.result",
+      ok: true,
+      pageIds: ["figma-seed-page"],
+    }),
+  });
+  assert.equal(elements.get("status-text").textContent, "Codex 页面已发送");
+  assert.equal(elements.get("import-page").textContent, "Codex → Figma");
+  elements.get("seed-page").dispatch("click");
+  const seedRequest = parentMessages.findLast(
+    (message) => message.pluginMessage?.type === "page.seed.capture",
+  )?.pluginMessage;
+  assert.ok(seedRequest);
+  assert.equal(elements.get("status-text").textContent, "正在读取选中的 Figma 页面…");
+  assert.equal(elements.get("status-detail").textContent, "已接收操作，正在检查并打包所选图层");
+  assert.equal(elements.get("seed-page").textContent, "处理中…");
+  assert.equal(elements.get("seed-page").disabled, true);
+  assert.equal(elements.get("import-page").disabled, true);
+  window.onmessage({
+    data: {
+      pluginMessage: {
+        type: "plugin.error",
+        requestId: seedRequest.requestId,
+        error: "test retry",
+      },
+    },
+  });
+  assert.equal(elements.get("seed-page").textContent, "Figma → Codex");
+  sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "page.catalog",
+      pages: [{
+        id: "codex-first-page",
+        name: "Codex first",
+        entry: "index.html",
+        route: "/",
+        state: "not_imported",
+        acceptsFigmaSeed: false,
+      }],
+    }),
+  });
+  assert.equal(elements.get("seed-page").hidden, true);
+  assert.equal(elements.get("import-page").hidden, false);
   elements.get("reset-workspace").dispatch("click");
   assert.equal(JSON.parse(sockets[0].lastSent).type, "workspace.reset.request");
   sockets[0].onmessage({
-    data: JSON.stringify({ type: "workspace.reset.result", ok: true }),
+    data: JSON.stringify({
+      type: "workspace.reset.result",
+      ok: true,
+      pages: [{
+        id: "codex-first-page",
+        name: "Codex first",
+        entry: "index.html",
+        route: "/",
+        state: "not_imported",
+        acceptsFigmaSeed: false,
+      }],
+    }),
   });
   assert.ok(
     parentMessages.some(
@@ -244,14 +363,10 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
   window.onmessage({
     data: { pluginMessage: { type: "workspace.reset.complete" } },
   });
-  assert.equal(elements.get("catalog-count").textContent, "frontend · 0 个");
+  assert.equal(elements.get("catalog-count").textContent, "frontend · 1 个");
   assert.equal(elements.get("catalog-list").children.length, 1);
-  assert.match(
-    elements.get("catalog-list").children[0].textContent,
-    /当前项目没有可用页面/,
-  );
   assert.equal(elements.get("status-text").textContent, "已连接 · frontend");
-  assert.match(elements.get("status-detail").textContent, /Codex 项目仍保持打开/);
+  assert.match(elements.get("status-detail").textContent, /页面目录已恢复/);
   assert.equal(elements.get("capture").disabled, true);
   assert.equal(elements.get("reset-workspace").disabled, true);
 });
@@ -798,9 +913,31 @@ test("Figma plugin handles SVG feedback and hybrid page ChangeSets without destr
   assert.equal(heroPhoto.fills[0].scaleMode, "FILL");
   assert.deepEqual(
     Array.from(secondaryCta.fills, (paint) => paint.type),
-    ["GRADIENT_LINEAR", "SOLID"],
+    ["GRADIENT_LINEAR", "GRADIENT_ANGULAR", "SOLID"],
   );
   assert.equal(secondaryCta.fills[0].gradientStops[0].color.a, 1);
+  assert.equal(secondaryCta.fills[1].gradientStops[1].position, 0.72);
+  const angularTransform = plain(secondaryCta.fills[1].gradientTransform);
+  assert.ok(Math.abs(angularTransform[0][0] - Math.cos(-Math.PI / 3)) < 1e-10);
+  assert.ok(Math.abs(angularTransform[0][1] + Math.sin(-Math.PI / 3)) < 1e-10);
+  assert.ok(Math.abs(angularTransform[1][0] - Math.sin(-Math.PI / 3)) < 1e-10);
+  assert.ok(Math.abs(angularTransform[1][1] - Math.cos(-Math.PI / 3)) < 1e-10);
+  assert.ok(
+    Math.abs(
+      angularTransform[0][0] * 0.5 +
+        angularTransform[0][1] * 0.5 +
+        angularTransform[0][2] -
+        0.4,
+    ) < 1e-10,
+  );
+  assert.ok(
+    Math.abs(
+      angularTransform[1][0] * 0.5 +
+        angularTransform[1][1] * 0.5 +
+        angularTransform[1][2] -
+        0.6,
+    ) < 1e-10,
+  );
   assert.equal(secondaryCta.effects[0].offset.x, 0);
   assert.equal(secondaryCta.effects[0].offset.y, 8);
   assert.equal(secondaryCta.effects[0].radius, 18);
@@ -1058,6 +1195,49 @@ test("Figma plugin handles SVG feedback and hybrid page ChangeSets without destr
     messages.filter((message) => message.type === "page.changes.emit").length,
     emittedChangeSets,
   );
+
+  figma.ui.onmessage({
+    type: "page.changes.accepted",
+    pageId: "landing-page",
+    previousSourceHash: "page-hash-1",
+    sourceHash: "page-hash-after-apply",
+    state: "applied",
+  });
+  await waitFor(
+    () => pageRoot.getPluginData("figmaSyncSourceHash") === "page-hash-after-apply",
+  );
+  assert.ok(
+    pageRoot
+      .findAll(
+        (node) =>
+          node.getPluginData("figmaSyncRole") === "page-node",
+      )
+      .every(
+        (node) =>
+          node.getPluginData("figmaSyncSourceHash") === "page-hash-after-apply",
+      ),
+  );
+  figma.ui.onmessage({
+    type: "page.changes.accepted",
+    pageId: "landing-page",
+    previousSourceHash: "page-hash-1",
+    sourceHash: "must-not-overwrite",
+    state: "partial",
+  });
+  assert.equal(
+    pageRoot.getPluginData("figmaSyncSourceHash"),
+    "page-hash-after-apply",
+  );
+
+  for (const node of [pageRoot, ...pageRoot.findAll(() => true)]) {
+    if (
+      ["page-root", "page-node"].includes(
+        node.getPluginData("figmaSyncRole"),
+      )
+    ) {
+      node.setPluginData("figmaSyncSourceHash", "page-hash-1");
+    }
+  }
 
   const vectorInsertChangeSetCount = messages.filter(
     (message) => message.type === "page.changes.emit",
@@ -2065,6 +2245,65 @@ test("Figma plugin handles SVG feedback and hybrid page ChangeSets without destr
   assert.equal(absoluteChild.x, 80);
   assert.equal(absoluteChild.y, 120);
 
+  const preservedPositionPage = new MockNode("PAGE", "Preserved browser positions");
+  figma.root.appendChild(preservedPositionPage);
+  figma.currentPage = preservedPositionPage;
+  const preservedPositionManifest = pageManifest("preserved-position-hash");
+  preservedPositionManifest.pageId = "preserved-position-page";
+  preservedPositionManifest.root.layout.preservePositions = true;
+  preservedPositionManifest.root.children[1].x = 40;
+  preservedPositionManifest.root.children[1].y = 720;
+  const preservedPositionResultCount = messages.filter(
+    (message) => message.type === "page.result",
+  ).length;
+  figma.ui.onmessage({
+    type: "page.upsert",
+    page: preservedPositionManifest,
+  });
+  await waitFor(
+    () =>
+      messages.filter((message) => message.type === "page.result").length >
+      preservedPositionResultCount,
+  );
+  const preservedPositionRoot = findImportedPageRoot(preservedPositionPage);
+  const preservedPositionChild = findImportedPageNode(
+    preservedPositionRoot,
+    "secondary-cta",
+  );
+  assert.equal(preservedPositionRoot.layoutMode, "NONE");
+  assert.equal(preservedPositionChild.x, 40);
+  assert.equal(preservedPositionChild.y, 720);
+
+  const positionedChildManifest = pageManifest("positioned-child-hash");
+  positionedChildManifest.pageId = "positioned-child-page";
+  positionedChildManifest.root.layout = {
+    ...positionedChildManifest.root.layout,
+    preservePositions: true,
+  };
+  positionedChildManifest.root.children[1].layoutItem = {
+    ...positionedChildManifest.root.children[1].layoutItem,
+    positioning: "absolute",
+  };
+  positionedChildManifest.root.children[1].x = 980;
+  positionedChildManifest.root.children[1].y = 72;
+  const positionedPage = new MockNode("PAGE", "Positioned descendants");
+  figma.root.appendChild(positionedPage);
+  figma.currentPage = positionedPage;
+  const positionedResultCount = messages.filter(
+    (message) => message.type === "page.result",
+  ).length;
+  figma.ui.onmessage({ type: "page.upsert", page: positionedChildManifest });
+  await waitFor(
+    () =>
+      messages.filter((message) => message.type === "page.result").length >
+      positionedResultCount,
+  );
+  const positionedRoot = findImportedPageRoot(positionedPage);
+  const positionedChild = findImportedPageNode(positionedRoot, "secondary-cta");
+  assert.equal(positionedRoot.layoutMode, "NONE");
+  assert.equal(positionedChild.x, 980);
+  assert.equal(positionedChild.y, 72);
+
   const failedPage = new MockNode("PAGE", "Failed import");
   figma.root.appendChild(failedPage);
   figma.currentPage = failedPage;
@@ -2177,7 +2416,23 @@ test("Figma plugin seeds an empty Codex page from one selected frame", async () 
     opacity: 1,
     visible: true,
   }];
+  const group = new MockNode("GROUP", "Toolbar group");
+  group.width = 342;
+  group.height = 56;
+  delete group.layoutMode;
+  delete group.layoutWrap;
+  delete group.itemSpacing;
+  delete group.counterAxisSpacing;
+  delete group.paddingTop;
+  delete group.paddingRight;
+  delete group.paddingBottom;
+  delete group.paddingLeft;
+  delete group.primaryAxisAlignItems;
+  delete group.counterAxisAlignItems;
+  delete group.primaryAxisSizingMode;
+  delete group.counterAxisSizingMode;
   frame.appendChild(title);
+  frame.appendChild(group);
   page.appendChild(frame);
   page.selection = [frame];
 
@@ -2205,9 +2460,210 @@ test("Figma plugin seeds an empty Codex page from one selected frame", async () 
     emitted.changeSet.changes[0].to.node.children[0].text,
     "From Figma",
   );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      emitted.changeSet.changes[0].to.node.children[1].layout,
+    )),
+    {
+      kind: "none",
+      mode: "NONE",
+      direction: "none",
+      wrap: false,
+      itemSpacing: null,
+      counterAxisSpacing: null,
+      padding: null,
+      primaryAxisAlignItems: null,
+      counterAxisAlignItems: null,
+      primaryAxisSizingMode: null,
+      counterAxisSizingMode: null,
+    },
+  );
   assert.equal(frame.getPluginData("figmaSyncRole"), "page-root");
   assert.equal(frame.getPluginData("figmaSyncPageNodeId"), "page-root");
   assert.equal(title.getPluginData("figmaSyncRole"), "page-node");
+  assert.equal(group.getPluginData("figmaSyncRole"), "page-node");
+});
+
+test("Figma plugin transports a page over 200 nodes in safe chunks and maps it only after ack", async () => {
+  const source = await readFile(new URL("../plugin/code.js", import.meta.url), "utf8");
+  const messages = [];
+  const page = new MockNode("PAGE", "Figma source");
+  page.selection = [];
+  const figma = {
+    root: new MockNode("DOCUMENT", "Document"),
+    currentPage: page,
+    fileKey: "figma-large-seed-file",
+    mixed: Symbol("mixed"),
+    base64Encode(bytes) {
+      return Buffer.from(bytes).toString("base64");
+    },
+    viewport: {
+      center: { x: 0, y: 0 },
+      scrollAndZoomIntoView() {},
+    },
+    ui: {
+      onmessage: null,
+      postMessage(message) {
+        messages.push(message);
+      },
+    },
+    clientStorage: {
+      async getAsync() {
+        return undefined;
+      },
+      async setAsync() {},
+    },
+    showUI() {},
+    async loadAllPagesAsync() {},
+    on() {},
+    async loadFontAsync() {},
+  };
+  figma.root.appendChild(page);
+  const frame = new MockNode("FRAME", "Large landing page");
+  frame.enforcePluginDataLimit = true;
+  frame.width = 1440;
+  frame.height = 4000;
+  frame.layoutMode = "VERTICAL";
+  page.appendChild(frame);
+  for (let index = 0; index < 250; index += 1) {
+    const child = new MockNode("FRAME", `Card ${index}`);
+    child.width = 320;
+    child.height = 80;
+    frame.appendChild(child);
+  }
+  const hiddenVector = new MockNode("VECTOR", "Hidden decoration");
+  hiddenVector.width = 24;
+  hiddenVector.height = 24;
+  hiddenVector.visible = false;
+  hiddenVector.exportError = new Error(
+    "Failed to export node. This node may not have any visible layers.",
+  );
+  frame.appendChild(hiddenVector);
+  page.selection = [frame];
+
+  vm.runInNewContext(source, {
+    figma,
+    __html__: "<html></html>",
+    setTimeout,
+    clearTimeout,
+    console,
+    encodeURIComponent,
+    unescape,
+  });
+  await waitFor(() => typeof figma.ui.onmessage === "function");
+  figma.ui.onmessage({
+    type: "page.seed.capture",
+    pageId: "large-seed-page",
+    sourceHash: "large-seed-hash-before",
+    requestId: "large-seed-request",
+    pageSeedTransportVersion: 1,
+  });
+  await waitFor(() => messages.some((message) => message.type === "page.seed.complete"));
+
+  const begin = messages.find((message) => message.type === "page.seed.begin");
+  const chunks = messages.filter((message) => message.type === "page.seed.chunk");
+  assert.equal(begin.nodeCount, 252);
+  assert.equal(begin.chunkCount, 3);
+  assert.deepEqual(chunks.map((message) => message.records.length), [100, 100, 52]);
+  const hiddenVectorRecord = chunks
+    .flatMap((message) => message.records)
+    .find((record) => record.node.name === "Hidden decoration");
+  assert.equal(hiddenVectorRecord.node.type, "frame");
+  assert.equal(hiddenVectorRecord.node.visible, false);
+  assert.equal(frame.getPluginData("figmaSyncRole"), "");
+  assert.equal(frame.children[249].getPluginData("figmaSyncRole"), "");
+
+  figma.ui.onmessage({
+    type: "page.changes.accepted",
+    pageId: "large-seed-page",
+    sourceHash: "large-seed-hash-after",
+    changeSetId: begin.changeSetId,
+    state: "applied",
+  });
+  await waitFor(() => frame.getPluginData("figmaSyncRole") === "page-root");
+  assert.equal(frame.getPluginData("figmaSyncSourceHash"), "large-seed-hash-after");
+  assert.equal(frame.children[249].getPluginData("figmaSyncRole"), "page-node");
+  assert.equal(hiddenVector.getPluginData("figmaSyncPageNodeType"), "frame");
+  assert.equal(
+    frame.children[249].getPluginData("figmaSyncSourceHash"),
+    "large-seed-hash-after",
+  );
+  const structureIndex = JSON.parse(
+    frame.getPluginData("figmaSyncPageStructureBaseline"),
+  );
+  assert.equal(structureIndex.format, "cdb-chunked-plugin-data");
+  assert.ok(structureIndex.chunks > 1);
+  const structureChunkKeys = [...frame.pluginData.keys()].filter((key) =>
+    key.startsWith(
+      `figmaSyncPageStructureBaseline__chunk__${structureIndex.generation}__`,
+    ),
+  );
+  assert.equal(structureChunkKeys.length, structureIndex.chunks);
+  assert.ok(
+    structureChunkKeys.every(
+      (key) => Buffer.byteLength(frame.getPluginData(key), "utf8") <= 90 * 1024,
+    ),
+  );
+  assert.ok(
+    messages.every(
+      (message) =>
+        message.type !== "plugin.error" ||
+        !String(message.error).includes("100 kB"),
+    ),
+  );
+
+  frame.children[249].x += 12;
+  const changeSetCount = messages.filter(
+    (message) => message.type === "page.changes.emit",
+  ).length;
+  figma.ui.onmessage({ type: "review.capture", requestId: "large-change" });
+  await waitFor(
+    () =>
+      messages.filter((message) => message.type === "page.changes.emit").length >
+      changeSetCount,
+  );
+  const emitted = messages
+    .filter((message) => message.type === "page.changes.emit")
+    .at(-1);
+  assert.ok(
+    emitted.changeSet.changes.some(
+      (change) =>
+        change.nodeId ===
+          frame.children[249].getPluginData("figmaSyncPageNodeId") &&
+        change.property === "x",
+    ),
+  );
+  figma.ui.onmessage({
+    type: "page.changes.accepted",
+    pageId: "large-seed-page",
+    sourceHash: "large-seed-hash-after",
+    changeSetId: emitted.changeSet.changeSetId,
+    state: "applied",
+  });
+  await waitFor(() => {
+    try {
+      const refreshed = JSON.parse(
+        frame.getPluginData("figmaSyncPageStructureBaseline"),
+      );
+      return (
+        refreshed.format === "cdb-chunked-plugin-data" &&
+        refreshed.generation !== structureIndex.generation
+      );
+    } catch {
+      return false;
+    }
+  });
+  const refreshedIndex = JSON.parse(
+    frame.getPluginData("figmaSyncPageStructureBaseline"),
+  );
+  assert.ok(
+    frame.getPluginData(
+      `figmaSyncPageStructureBaseline__chunk__${refreshedIndex.generation}__0`,
+    ),
+  );
+  assert.ok(
+    structureChunkKeys.every((key) => frame.getPluginData(key) === ""),
+  );
 });
 
 function asset(sourceHash, fragment) {
@@ -2318,6 +2774,17 @@ function pageManifest(sourceHash) {
                 stops: [
                   { color: "#7262FF", position: 0 },
                   { color: "#4E3FE0", position: 1 },
+                ],
+              },
+              {
+                type: "conic-gradient",
+                angle: 30,
+                center: { x: 0.4, y: 0.6 },
+                stops: [
+                  { color: "#7262FF", position: 0 },
+                  { color: "#7262FF", position: 0.72 },
+                  { color: "#DED9F4", position: 0.72 },
+                  { color: "#DED9F4", position: 1 },
                 ],
               },
             ],
@@ -2578,6 +3045,7 @@ class MockNode {
     this.layoutSizingVertical = "FIXED";
     this.annotations = [];
     this.pluginData = new Map();
+    this.enforcePluginDataLimit = false;
   }
 
   resize(width, height) {
@@ -2586,6 +3054,14 @@ class MockNode {
   }
 
   setPluginData(key, value) {
+    if (
+      this.enforcePluginDataLimit &&
+      Buffer.byteLength(String(value), "utf8") > 100 * 1024
+    ) {
+      throw new Error(
+        "in setPluginData: This pluginData entry exceeds 100 kB per entry limit.",
+      );
+    }
     this.pluginData.set(key, value);
   }
 
@@ -2664,6 +3140,8 @@ class MockElement {
     this.disabled = false;
     this.children = [];
     this.listeners = new Map();
+    this.dataset = {};
+    this.open = false;
   }
 
   append(...children) {
@@ -2678,10 +3156,18 @@ class MockElement {
     this.listeners.set(type, callback);
   }
 
-  dispatch(type) {
+  dispatch(type, event = {}) {
     const callback = this.listeners.get(type);
     assert.ok(callback, `listener for ${type} is registered`);
-    callback();
+    callback(event);
+  }
+
+  showModal() {
+    this.open = true;
+  }
+
+  close() {
+    this.open = false;
   }
 }
 

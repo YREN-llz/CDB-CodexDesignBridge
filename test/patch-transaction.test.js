@@ -7,6 +7,7 @@ import {
   commitPatchTransaction,
   hashContent,
   undoLastPatchTransaction,
+  undoPatchTransactionById,
 } from "../codex-plugin/codex-design-bridge/mcp/patch-transaction.mjs";
 
 test("commits a multi-file patch and safely undoes it", async (t) => {
@@ -114,4 +115,37 @@ test("refuses undo after an unrelated edit", async (t) => {
     (error) => error.code === "undo_conflict",
   );
   assert.equal(await readFile(file, "utf8"), "unrelated user edit");
+});
+
+test("undo by id never rolls back a different transaction", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "cdb-exact-undo-"));
+  const first = path.join(projectDir, "first.txt");
+  const second = path.join(projectDir, "second.txt");
+  await writeFile(first, "first before", "utf8");
+  await writeFile(second, "second before", "utf8");
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+
+  const firstPatch = await commitPatchTransaction({
+    projectDir,
+    writes: [{ file: first, content: "first after" }],
+  });
+  await commitPatchTransaction({
+    projectDir,
+    writes: [{ file: second, content: "second after" }],
+  });
+
+  const undone = await undoPatchTransactionById(
+    projectDir,
+    firstPatch.transactionId,
+  );
+  assert.equal(undone.undoneTransactionId, firstPatch.transactionId);
+  assert.equal(await readFile(first, "utf8"), "first before");
+  assert.equal(await readFile(second, "utf8"), "second after");
+
+  const missing = await undoPatchTransactionById(
+    projectDir,
+    "1-00000000-0000-0000-0000-000000000000",
+  );
+  assert.equal(missing.status, "nothing_to_undo");
+  assert.equal(await readFile(second, "utf8"), "second after");
 });

@@ -24,6 +24,7 @@
 - 页面以 `.cdb/manifest.json` 为主；静态 HTML 旧项目可内存推断并显示警告。
 - Figma 插件协议为 14，并兼容协议 13 客户端迁移；未知未来协议安全保留为待处理。
 - 跨父级结构与位置回写、Auto Layout ↔ Flex/Grid、写回后的真实预览几何验证已进入 0.7.0。
+- Figma-first 复杂页面会自动分块传输，并在 Bridge 完整校验后一次性事务写入；大型基线也会分片保存，避开 Figma 单条 pluginData 100 kB 上限。当前安全范围为 2,000 个可编辑节点、64 MB 编码数据，任一分块缺失或无效时源码与 Figma 映射保持不变，可直接重试。
 - 自动化与 Windows `CheckOnly` 是候选证据，不等于真实桌面发布验收。
 - 本地项目转换、React/Vue/Vite、ZIP、批量多页面与完整 Figma 组件语义明确延期。
 

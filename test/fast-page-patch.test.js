@@ -774,6 +774,162 @@ test("fast page patch replaces a Figma seed root and removes its placeholder sty
   assert.match(css, /background-color: #2D1FF2 !important;/);
 });
 
+test("fast page patch safely normalizes legacy null layout modes from Figma groups", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "fast-page-group-"));
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<link rel="stylesheet" href="./styles.css"><main data-codex-root data-codex-id="page-root"><p data-codex-id="figma-seed-placeholder">Waiting</p></main>',
+    "utf8",
+  );
+  await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
+
+  const result = await applyFastPageChanges({
+    projectDir,
+    manifest: manifest(),
+    changeSet: {
+      pageId: "sample-page",
+      sourceHash: "page-hash",
+      changes: [{
+        nodeId: "page-root",
+        nodeType: "FRAME",
+        property: "pageSeed",
+        sourceRef: { selector: '[data-codex-id="page-root"]' },
+        to: {
+          node: {
+            id: "page-root",
+            type: "frame",
+            tag: "main",
+            name: "Page",
+            width: 402,
+            height: 874,
+            opacity: 1,
+            visible: true,
+            rotation: 0,
+            style: { fill: null, stroke: null, strokeWeight: null, cornerRadius: 0 },
+            layout: { kind: "none", mode: "NONE", direction: "none" },
+            children: [{
+              id: "figma-node-toolbar-group",
+              type: "frame",
+              tag: "div",
+              name: "Toolbar group",
+              width: 342,
+              height: 56,
+              opacity: 1,
+              visible: true,
+              rotation: 0,
+              style: { fill: null, stroke: null, strokeWeight: null, cornerRadius: null },
+              layout: {
+                kind: "flex",
+                mode: null,
+                direction: "none",
+                wrap: false,
+                itemSpacing: null,
+                counterAxisSpacing: null,
+                padding: null,
+                primaryAxisAlignItems: null,
+                counterAxisAlignItems: null,
+                primaryAxisSizingMode: null,
+                counterAxisSizingMode: null,
+              },
+              children: [],
+            }],
+          },
+        },
+      }],
+    },
+  });
+
+  assert.equal(result.appliedCount, 1);
+  assert.equal(result.pendingCount, 0);
+  const source = await readFile(path.join(projectDir, "index.html"), "utf8");
+  assert.match(source, /data-codex-id="figma-node-toolbar-group"/);
+});
+
+test("fast page patch accepts a chunk-reassembled seed over 200 nodes in one transaction", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "fast-large-page-seed-"));
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<link rel="stylesheet" href="./styles.css"><main data-codex-root data-codex-id="page-root"><p data-codex-id="figma-seed-placeholder">Waiting</p></main>',
+    "utf8",
+  );
+  await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
+  const children = Array.from({ length: 250 }, (_, index) => ({
+    id: `figma-node-card-${index}`,
+    type: "frame",
+    tag: "div",
+    name: `Card ${index}`,
+    width: 320,
+    height: 80,
+    opacity: 1,
+    visible: true,
+    rotation: 0,
+    style: {
+      fill: { color: "#FFFFFF", opacity: 1 },
+      stroke: null,
+      strokeWeight: 0,
+      cornerRadius: 8,
+    },
+    layout: {
+      mode: "NONE",
+      itemSpacing: 0,
+      padding: { top: 0, right: 0, bottom: 0, left: 0 },
+      primaryAxisAlignItems: "MIN",
+      counterAxisAlignItems: "MIN",
+    },
+    children: [],
+  }));
+  const result = await applyFastPageChanges({
+    projectDir,
+    manifest: manifest(),
+    changeSet: {
+      pageId: "sample-page",
+      sourceHash: "page-hash",
+      changes: [{
+        nodeId: "page-root",
+        nodeType: "FRAME",
+        property: "pageSeed",
+        sourceRef: { selector: '[data-codex-id="page-root"]' },
+        to: {
+          node: {
+            id: "page-root",
+            type: "frame",
+            tag: "main",
+            name: "Large page",
+            width: 1440,
+            height: 4000,
+            opacity: 1,
+            visible: true,
+            rotation: 0,
+            style: {
+              fill: { color: "#F5F5F5", opacity: 1 },
+              stroke: null,
+              strokeWeight: 0,
+              cornerRadius: 0,
+            },
+            layout: {
+              mode: "VERTICAL",
+              itemSpacing: 8,
+              padding: { top: 0, right: 0, bottom: 0, left: 0 },
+              primaryAxisAlignItems: "MIN",
+              counterAxisAlignItems: "MIN",
+            },
+            children,
+          },
+        },
+      }],
+    },
+  });
+
+  assert.equal(result.appliedCount, 1);
+  assert.equal(result.pendingCount, 0);
+  assert.equal(result.changedFiles.includes("index.html"), true);
+  const source = await readFile(path.join(projectDir, "index.html"), "utf8");
+  assert.match(source, /data-codex-id="figma-node-card-249"/);
+  assert.doesNotMatch(source, /figma-seed-placeholder/);
+});
+
 test("fast page patch inserts, reorders, and deletes mapped JSX children", async (t) => {
   const projectDir = await mkdtemp(path.join(os.tmpdir(), "fast-jsx-structure-"));
   t.after(() => rm(projectDir, { recursive: true, force: true }));
@@ -1582,6 +1738,86 @@ test("fast page patch keeps a future structural protocol safely pending", async 
   assert.equal(await readFile(path.join(projectDir, "index.html"), "utf8"), '<main data-codex-id="page"></main>\n');
 });
 
+test("stale whole-page hashes safely rebase unchanged visual targets", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "fast-safe-rebase-"));
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<link rel="stylesheet" href="./styles.css"><aside data-codex-id="sidebar-progress"></aside>\n',
+    "utf8",
+  );
+  await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
+  const baseline = visualManifest("#F5F3FF", "#E8E3FF", "old-figma-hash");
+  const current = visualManifest("#F5F3FF", "#E8E3FF", "current-capture-hash");
+  const fill = change("sidebar-progress", "FRAME", "fill", {
+    color: "#6D5DFC",
+    opacity: 1,
+  });
+  fill.from = { color: "#F5F3FF", opacity: 1 };
+  const stroke = change("sidebar-progress", "FRAME", "stroke", null);
+  stroke.from = { color: "#E8E3FF", opacity: 1 };
+
+  const result = await applyFastPageChanges({
+    projectDir,
+    manifest: baseline,
+    baselineManifest: baseline,
+    baselineSourceHash: "old-project-source",
+    currentManifest: current,
+    currentSourceHash: "new-project-source",
+    changeSet: {
+      protocolVersion: 14,
+      pageId: "sample-page",
+      sourceHash: "old-figma-hash",
+      changes: [fill, stroke],
+    },
+  });
+
+  assert.equal(result.appliedCount, 2);
+  assert.equal(result.pendingCount, 0);
+  const css = await readFile(path.join(projectDir, "styles.css"), "utf8");
+  assert.match(css, /background: #6D5DFC !important;/);
+  assert.match(css, /border: 0 !important;/);
+});
+
+test("stale whole-page hashes never overwrite a changed source target", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "fast-rebase-conflict-"));
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+  const originalCss = ".sidebar-progress { background: #123456; }\n";
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<link rel="stylesheet" href="./styles.css"><aside data-codex-id="sidebar-progress"></aside>\n',
+    "utf8",
+  );
+  await writeFile(path.join(projectDir, "styles.css"), originalCss, "utf8");
+  const baseline = visualManifest("#F5F3FF", "#E8E3FF", "old-figma-hash");
+  const current = visualManifest("#123456", "#E8E3FF", "current-capture-hash");
+  const fill = change("sidebar-progress", "FRAME", "fill", {
+    color: "#6D5DFC",
+    opacity: 1,
+  });
+  fill.from = { color: "#F5F3FF", opacity: 1 };
+
+  const result = await applyFastPageChanges({
+    projectDir,
+    manifest: baseline,
+    baselineManifest: baseline,
+    baselineSourceHash: "old-project-source",
+    currentManifest: current,
+    currentSourceHash: "new-project-source",
+    changeSet: {
+      protocolVersion: 14,
+      pageId: "sample-page",
+      sourceHash: "old-figma-hash",
+      changes: [fill],
+    },
+  });
+
+  assert.equal(result.appliedCount, 0);
+  assert.equal(result.pendingCount, 1);
+  assert.equal(result.pending[0].reason, "source_target_changed");
+  assert.equal(await readFile(path.join(projectDir, "styles.css"), "utf8"), originalCss);
+});
+
 test("protocol 14 rejects incomplete structural payloads without writing files", async (t) => {
   const projectDir = await mkdtemp(path.join(os.tmpdir(), "fast-invalid-v14-"));
   t.after(() => rm(projectDir, { recursive: true, force: true }));
@@ -1681,5 +1917,33 @@ function manifest() {
   return {
     pageId: "sample-page",
     sourceHash: "page-hash",
+  };
+}
+
+function visualManifest(fill, stroke, sourceHash) {
+  return {
+    pageId: "sample-page",
+    sourceHash,
+    root: {
+      id: "root",
+      type: "frame",
+      width: 1440,
+      height: 900,
+      x: 0,
+      y: 0,
+      style: {},
+      children: [
+        {
+          id: "sidebar-progress",
+          type: "frame",
+          width: 180,
+          height: 58,
+          x: 0,
+          y: 0,
+          style: { fill, stroke, strokeWidth: 1 },
+          children: [],
+        },
+      ],
+    },
   };
 }

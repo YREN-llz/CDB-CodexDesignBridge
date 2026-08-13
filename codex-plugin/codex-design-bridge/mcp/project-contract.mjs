@@ -96,13 +96,14 @@ export async function createFigmaSeedProject({
 }) {
   const workspace = await normalizeDirectory(workspaceDir, "没有可写入设计的位置。");
   const requested = sanitizeProjectName(projectName || "figma-design");
+  const displayName = String(projectName || "Figma Design").trim().slice(0, 80) || "Figma Design";
   const targetDir = await nextAvailableDirectory(workspace, requested);
   const stagingDir = path.join(
     workspace,
     `.${path.basename(targetDir)}.cdb-create-${process.pid}-${Date.now()}`,
   );
   const manifest = createManifest({
-    name: "Figma Design",
+    name: displayName,
     projectId: stableId(path.basename(targetDir)),
     htmlPages: [{ entry: "index.html", name: "Page", route: "/" }],
     sourceKind: "figma-seed",
@@ -258,6 +259,10 @@ export async function preflightDesignProject(projectDir) {
       continue;
     }
     sourceParts.push(page.entry, html);
+    const pageSourceParts = [
+      html,
+      JSON.stringify(page.captureState || null),
+    ];
     const rootCount = (html.match(/\bdata-codex-root(?:\s|=|>)/gi) || []).length;
     const ids = [...html.matchAll(/\bdata-codex-id\s*=\s*(["'])(.*?)\1/gi)]
       .map((match) => match[2].trim())
@@ -363,7 +368,8 @@ export async function preflightDesignProject(projectDir) {
         path.posix.join(path.posix.dirname(page.entry), clean),
       );
       dependencies.add(relative);
-      if (!(await exists(safeProjectPath(descriptor.rootDir, relative)))) {
+      const dependencyPath = safeProjectPath(descriptor.rootDir, relative);
+      if (!(await exists(dependencyPath))) {
         issues.push(issue({
           code: "resource_missing",
           level: "blocker",
@@ -371,6 +377,14 @@ export async function preflightDesignProject(projectDir) {
           file: page.entry,
           message: `资源不存在：${relative}`,
         }));
+      } else {
+        try {
+          const dependencyHash = hashContent(await readFile(dependencyPath));
+          pageSourceParts.push(relative, dependencyHash);
+          sourceParts.push(relative, dependencyHash);
+        } catch {
+          // Directories and other non-file references remain existence-checked.
+        }
       }
     }
 
@@ -383,9 +397,10 @@ export async function preflightDesignProject(projectDir) {
       captureRoot: page.captureRoot,
       ...(page.captureState ? { captureState: { ...page.captureState } } : {}),
       viewport: { ...page.viewport },
-      sourceHash: hashContent(
-        `${html}\u0000${JSON.stringify(page.captureState || null)}`,
-      ),
+      sourceHash: hashContent(pageSourceParts.join("\u0000")),
+      acceptsFigmaSeed:
+        descriptor.manifest.source.kind === "figma-seed" &&
+        ids.includes("figma-seed-placeholder"),
       estimatedEditableLayers: Math.max(ids.length, rootCount),
     });
   }
@@ -464,14 +479,16 @@ export function workspacePagesFromReport(report, previousPages = []) {
   return report.pages.map((page) => {
     const old = previous.get(page.id) || {};
     const sourceChanged = old.sourceHash && old.sourceHash !== page.sourceHash;
+    const acceptsFigmaSeed = Boolean(page.acceptsFigmaSeed);
     return {
       ...page,
-      acceptsFigmaSeed:
-        report.descriptor?.manifest?.source?.kind === "figma-seed",
-      figmaReady: Boolean(old.figmaReady),
+      acceptsFigmaSeed,
+      figmaReady: acceptsFigmaSeed ? false : Boolean(old.figmaReady),
       lastSentAt: old.lastSentAt || "",
       nodeCount: Number.isInteger(old.nodeCount) ? old.nodeCount : 0,
-      syncState: !old.figmaReady
+      syncState: acceptsFigmaSeed
+        ? "not_imported"
+        : !old.figmaReady
         ? "not_imported"
         : sourceChanged
           ? "source_changed"
@@ -481,6 +498,7 @@ export function workspacePagesFromReport(report, previousPages = []) {
 }
 
 function createManifest({ name, projectId, htmlPages, sourceKind }) {
+  const pageIdScope = sourceKind === "figma-seed" ? projectId : "";
   return {
     schemaVersion: MANIFEST_VERSION,
     projectId,
@@ -490,7 +508,7 @@ function createManifest({ name, projectId, htmlPages, sourceKind }) {
     pages: htmlPages.map((page, index) => {
       const captureState = normalizeCaptureState(page.captureState);
       return {
-        id: uniquePageId(page, index),
+        id: uniquePageId(page, index, pageIdScope),
         name: String(page.name || `Page ${index + 1}`).slice(0, 80),
         entry: normalizeRelativePath(page.entry),
         route: normalizeRoute(page.route),
@@ -866,9 +884,10 @@ function sanitizeProjectName(value) {
     : "design-draft";
 }
 
-function uniquePageId(page, index) {
+function uniquePageId(page, index, scope = "") {
   const base = stableId(page.route === "/" ? "home" : page.name || page.entry);
-  return index === 0 ? base : `${base}-${index + 1}`;
+  const scopedBase = scope ? `${stableId(scope)}-${base}` : base;
+  return index === 0 ? scopedBase : `${scopedBase}-${index + 1}`;
 }
 
 function stableId(value) {

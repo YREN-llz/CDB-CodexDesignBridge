@@ -210,7 +210,7 @@ function normalizeGradientFills(fills, path) {
     }
     const type = optionalEnum(
       fill.type,
-      ["linear-gradient", "radial-gradient"],
+      ["linear-gradient", "radial-gradient", "conic-gradient"],
       "linear-gradient",
       `${fillPath}.type`,
     );
@@ -242,6 +242,9 @@ function normalizeGradientFills(fills, path) {
               x: boundedNumber(fill.center?.x, 0.5, 0, 1, `${fillPath}.center.x`),
               y: boundedNumber(fill.center?.y, 0.5, 0, 1, `${fillPath}.center.y`),
             },
+            ...(type === "conic-gradient"
+              ? { angle: finiteNumber(fill.angle, 0, `${fillPath}.angle`) }
+              : {}),
           }),
     };
   });
@@ -292,6 +295,7 @@ function normalizeLayout(layout, path) {
       wrap: false,
       primarySizing: "fixed",
       counterSizing: "fixed",
+      preservePositions: false,
     };
   }
   if (!layout || typeof layout !== "object" || Array.isArray(layout)) {
@@ -341,6 +345,10 @@ function normalizeLayout(layout, path) {
       "fixed",
       `${path}.counterSizing`,
     ),
+    preservePositions:
+      typeof layout.preservePositions === "boolean"
+        ? layout.preservePositions
+        : false,
     ...(layout.kind === "grid"
       ? {
           grid: {
@@ -407,6 +415,7 @@ function normalizeFont(font, path) {
   if (font === undefined) {
     return {
       family: "Inter",
+      fallbacks: [],
       style: "Regular",
       size: 16,
       lineHeight: 24,
@@ -418,6 +427,7 @@ function normalizeFont(font, path) {
   }
   return {
     family: optionalString(font.family, "Inter", `${path}.family`, 120),
+    fallbacks: normalizeFontFallbacks(font.fallbacks, `${path}.fallbacks`),
     style: optionalString(font.style, "Regular", `${path}.style`, 120),
     size: positiveNumber(font.size ?? 16, `${path}.size`),
     lineHeight: positiveNumber(
@@ -430,6 +440,16 @@ function normalizeFont(font, path) {
       `${path}.letterSpacing`,
     ),
   };
+}
+
+function normalizeFontFallbacks(value, path) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 8) {
+    throw new PageValidationError(`${path} must be an array of at most 8 font families.`);
+  }
+  return value.map((family, index) =>
+    optionalString(family, "", `${path}[${index}]`, 120),
+  ).filter(Boolean);
 }
 
 function normalizeSourceRef(value, path) {

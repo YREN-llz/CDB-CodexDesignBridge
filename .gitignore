@@ -5,9 +5,14 @@ node_modules/
 .figma-sync/
 .codex/
 .cdb-imports/
+.cdb-runtime-backup/
 **/.figma-sync/
 **/.codex/design-bridge.json
 **/.codex/design-bridge-token
+
+# Local design workspaces and agent scratch data
+team-workbench-web/
+.workbuddy/
 
 # Local secrets and environment overrides
 .env

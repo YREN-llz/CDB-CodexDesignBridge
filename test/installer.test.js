@@ -63,8 +63,8 @@ test(
     assert.equal(report.version, manifestVersion());
     assert.equal(report.checkOnly, true);
     assert.equal(report.status, "package-valid");
-    assert.equal(report.coreFileCount, 18);
-    assert.equal(Object.keys(report.hashes).length, 18);
+    assert.equal(report.coreFileCount, 21);
+    assert.equal(Object.keys(report.hashes).length, 21);
     assert.match(report.hashes["mcp/browser-capture.mjs"], /^[A-F0-9]{64}$/);
     assert.match(report.hashes[".codex-plugin/plugin.json"], /^[A-F0-9]{64}$/);
     const installerSource = readFileSync(installerPath, "utf8");
@@ -99,8 +99,8 @@ test(
     assert.equal(report.version, manifestVersion());
     assert.equal(report.checkOnly, true);
     assert.equal(report.status, "package-valid");
-    assert.equal(report.coreFileCount, 18);
-    assert.equal(Object.keys(report.hashes).length, 18);
+    assert.equal(report.coreFileCount, 21);
+    assert.equal(Object.keys(report.hashes).length, 21);
     assert.match(report.hashes["mcp/browser-capture.mjs"], /^[a-f0-9]{64}$/);
     assert.match(report.hashes[".codex-plugin/plugin.json"], /^[a-f0-9]{64}$/);
   },
@@ -251,8 +251,15 @@ test(
 );
 
 function runInstaller(argumentsList) {
-  return spawnSync(
+  const powershell = path.join(
+    process.env.SystemRoot || "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
     "powershell.exe",
+  );
+  return spawnSync(
+    powershell,
     [
       "-NoLogo",
       "-NoProfile",

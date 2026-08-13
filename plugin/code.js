@@ -13,12 +13,23 @@ const PAGE_SVG_BASELINE_KEY = "figmaSyncPageSvgBaseline";
 const PAGE_ANNOTATION_BASELINE_KEY = "figmaSyncPageAnnotationBaseline";
 const PAGE_STRUCTURE_BASELINE_KEY = "figmaSyncPageStructureBaseline";
 const PAGE_VECTOR_INSERT_VERSION_KEY = "figmaSyncPageVectorInsertVersion";
+const CHUNKED_PLUGIN_DATA_FORMAT = "cdb-chunked-plugin-data";
+const CHUNKED_PLUGIN_DATA_VERSION = 1;
+const PLUGIN_DATA_CHUNK_MAX_BYTES = 90 * 1024;
+const PLUGIN_DATA_CHUNK_MAX_COUNT = 512;
+const PLUGIN_DATA_CHUNK_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
 const DESIGN_ID_KEY = "codexDesignId";
 const DESIGN_NODE_ID_KEY = "codexDesignNodeId";
 const ROLE_ROOT = "asset-root";
 const ROLE_TARGET = "element-target";
 const ROLE_PAGE_ROOT = "page-root";
 const ROLE_PAGE_NODE = "page-node";
+const CHUNKABLE_PAGE_DATA_KEYS = new Set([
+  PAGE_BASELINE_KEY,
+  PAGE_SVG_BASELINE_KEY,
+  PAGE_ANNOTATION_BASELINE_KEY,
+  PAGE_STRUCTURE_BASELINE_KEY,
+]);
 const DESIGN_ROOT_TYPES = new Set([
   "FRAME",
   "COMPONENT",
@@ -48,6 +59,13 @@ const INSERTABLE_PAGE_FRAME_TYPES = new Set([
 ]);
 const MAX_INSERTED_PAGE_NODES = 200;
 const MAX_INSERTED_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_PAGE_SEED_NODES = 2000;
+const MAX_PAGE_SEED_CHUNKS = 128;
+const MAX_PAGE_SEED_TOTAL_BYTES = 64 * 1024 * 1024;
+const PAGE_SEED_CHUNK_NODE_LIMIT = 100;
+const PAGE_SEED_CHUNK_BYTES = 4 * 1024 * 1024;
+const PAGE_SEED_PENDING_TIMEOUT_MS = 90 * 1000;
+const PAGE_SEED_TRANSPORT_VERSION = 1;
 const PAGE_CHANGE_PROTOCOL_VERSION = 14;
 const EDITABLE_PROPERTIES = new Set([
   "fills",
@@ -138,6 +156,7 @@ const LAYOUT_PROPERTIES = new Set([
 let suppressChangesUntil = 0;
 const snapshots = new Map();
 const pendingFlushes = new Map();
+const pendingPageSeeds = new Map();
 let pageStatusTimer = null;
 let lastReportedUnsentChanges = null;
 const trackedPageFigmaNodeIds = new Set();
@@ -282,6 +301,10 @@ async function handleUiMessage(message) {
       await captureSelectedPageSeed(message);
       return;
     }
+    if (message.type === "page.seed.abort") {
+      abortPendingPageSeed(message);
+      return;
+    }
     if (message.type === "design.capture") {
       await captureSelectedDesign();
       return;
@@ -327,6 +350,10 @@ function resetWorkspaceAssociations() {
     clearTimeout(pending.timer);
   }
   pendingFlushes.clear();
+  for (const pending of pendingPageSeeds.values()) {
+    clearTimeout(pending.timer);
+  }
+  pendingPageSeeds.clear();
   snapshots.clear();
   trackedPageFigmaNodeIds.clear();
 
@@ -352,7 +379,13 @@ function resetWorkspaceAssociations() {
       if (role === ROLE_PAGE_ROOT || role === ROLE_PAGE_NODE) {
         node.setPluginData(ROLE_KEY, "");
         node.setPluginData(SOURCE_HASH_KEY, "");
-        for (const key of pageKeys) node.setPluginData(key, "");
+        for (const key of pageKeys) {
+          if (CHUNKABLE_PAGE_DATA_KEYS.has(key)) {
+            clearChunkedPluginData(node, key);
+          } else {
+            node.setPluginData(key, "");
+          }
+        }
       }
     }
   }
@@ -694,10 +727,7 @@ async function reconcilePageNode({
         node.insertChild(index, child);
       }
       retained.add(child);
-      if (node.layoutMode === "NONE") {
-        child.x = childDefinition.x;
-        child.y = childDefinition.y;
-      }
+      applyChildPlacement(node, child, childDefinition, definition.layout);
       applyLayoutItem(child, childDefinition.layoutItem);
     }
     for (const child of [...node.children]) {
@@ -787,10 +817,9 @@ async function createPageNode({
         isRoot: false,
         annotationsByNode,
       });
-      if (node.layoutMode === "NONE") {
-        child.x = childDefinition.x;
-        child.y = childDefinition.y;
-      } else if (
+      applyChildPlacement(node, child, childDefinition, definition.layout);
+      if (
+        node.layoutMode !== "NONE" &&
         definition.layout.align === "stretch" &&
         "layoutAlign" in child
       ) {
@@ -831,24 +860,40 @@ async function createPageNode({
 }
 
 async function loadPageFont(font) {
-  const requested = { family: font.family, style: font.style };
-  try {
-    await figma.loadFontAsync(requested);
-    return requested;
-  } catch {
-    const fallback = { family: "Inter", style: "Regular" };
-    await figma.loadFontAsync(fallback);
-    return fallback;
+  const families = [
+    font.family,
+    ...(Array.isArray(font.fallbacks) ? font.fallbacks : []),
+    "Inter",
+  ].filter((family, index, list) => family && list.indexOf(family) === index);
+  const attempts = [];
+  for (const family of families) {
+    attempts.push({ family, style: font.style });
+    if (font.style !== "Regular") attempts.push({ family, style: "Regular" });
   }
+  for (const candidate of attempts) {
+    try {
+      await figma.loadFontAsync(candidate);
+      return candidate;
+    } catch {}
+  }
+  const fallback = { family: "Inter", style: "Regular" };
+  await figma.loadFontAsync(fallback);
+  return fallback;
 }
 
 function applyFrameLayout(frame, layout) {
-  frame.layoutMode =
+  const requestedLayoutMode =
     layout.direction === "horizontal"
       ? "HORIZONTAL"
       : layout.direction === "vertical"
         ? "VERTICAL"
         : "NONE";
+  // Browser layout can place flex/grid children at coordinates that Figma
+  // Auto Layout cannot express one-to-one (for example margin-top:auto,
+  // CSS grid tracks, and wrapped rows with asymmetric free space). The
+  // capture marks these containers as freeform so we preserve the measured
+  // browser coordinates instead of compacting their children in Figma.
+  frame.layoutMode = layout.preservePositions ? "NONE" : requestedLayoutMode;
   frame.itemSpacing = layout.gap;
   if ("layoutWrap" in frame) {
     frame.layoutWrap = layout.wrap ? "WRAP" : "NO_WRAP";
@@ -880,6 +925,21 @@ function applyFrameLayout(frame, layout) {
         stretch: "MIN",
         baseline: "BASELINE",
       }[layout.align] || "MIN";
+  }
+}
+
+function frameUsesCoordinateLayout(layout) {
+  return Boolean(
+    layout?.preservePositions ||
+      layout?.kind === "grid" ||
+      layout?.direction === "none",
+  );
+}
+
+function applyChildPlacement(parent, child, definition, parentLayout) {
+  if (frameUsesCoordinateLayout(parentLayout) || parent.layoutMode === "NONE") {
+    child.x = definition.x;
+    child.y = definition.y;
   }
 }
 
@@ -986,15 +1046,33 @@ function applyNodeStyle(node, style, { clearFill = false } = {}) {
 }
 
 function gradientPaint(fill) {
-  const angle = ((fill.angle ?? 180) * Math.PI) / 180;
+  const angle =
+    (((fill.angle ?? (fill.type === "conic-gradient" ? 0 : 180)) - 90) *
+      Math.PI) /
+    180;
   const direction = { x: Math.sin(angle), y: -Math.cos(angle) };
   const perpendicular = { x: -direction.y, y: direction.x };
+  const conicCos = Math.cos(angle);
+  const conicSin = Math.sin(angle);
   const transform =
     fill.type === "radial-gradient"
       ? [
           [1, 0, fill.center.x - 0.5],
           [0, 1, fill.center.y - 0.5],
         ]
+      : fill.type === "conic-gradient"
+        ? [
+            [
+              conicCos,
+              -conicSin,
+              fill.center.x - (conicCos - conicSin) / 2,
+            ],
+            [
+              conicSin,
+              conicCos,
+              fill.center.y - (conicSin + conicCos) / 2,
+            ],
+          ]
       : [
           [
             direction.x,
@@ -1008,7 +1086,12 @@ function gradientPaint(fill) {
           ],
         ];
   return {
-    type: fill.type === "radial-gradient" ? "GRADIENT_RADIAL" : "GRADIENT_LINEAR",
+    type:
+      fill.type === "radial-gradient"
+        ? "GRADIENT_RADIAL"
+        : fill.type === "conic-gradient"
+          ? "GRADIENT_ANGULAR"
+          : "GRADIENT_LINEAR",
     gradientTransform: transform,
     gradientStops: fill.stops.map((stop) => ({
       position: stop.position,
@@ -1062,22 +1145,28 @@ function setPageNodeData(node, page, definition, isRoot) {
 
 function storePageBaselines(root) {
   for (const node of findTrackedPageNodes(root)) {
-    node.setPluginData(
+    setChunkedPluginData(
+      node,
       PAGE_BASELINE_KEY,
       JSON.stringify(snapshotNodeProperties(node)),
     );
     if (isTrackedSvgNode(node)) {
-      node.setPluginData(
+      setChunkedPluginData(
+        node,
         PAGE_SVG_BASELINE_KEY,
         JSON.stringify(snapshotSvgSubtree(node)),
       );
+    } else {
+      clearChunkedPluginData(node, PAGE_SVG_BASELINE_KEY);
     }
-    node.setPluginData(
+    setChunkedPluginData(
+      node,
       PAGE_ANNOTATION_BASELINE_KEY,
       JSON.stringify(collectDirectFigmaAnnotations(node)),
     );
   }
-  root.setPluginData(
+  setChunkedPluginData(
+    root,
     PAGE_STRUCTURE_BASELINE_KEY,
     JSON.stringify(snapshotPageStructure(root)),
   );
@@ -1088,47 +1177,51 @@ function ensurePageBaselines(root) {
   for (const node of findTrackedPageNodes(root)) {
     const baseline = readPageBaseline(node);
     if (
-      !node.getPluginData(PAGE_BASELINE_KEY) ||
+      !hasChunkedPluginData(node, PAGE_BASELINE_KEY) ||
       !("layoutKind" in baseline)
     ) {
-      node.setPluginData(
+      setChunkedPluginData(
+        node,
         PAGE_BASELINE_KEY,
         JSON.stringify(snapshotNodeProperties(node)),
       );
     }
     if (
       isTrackedSvgNode(node) &&
-      !node.getPluginData(PAGE_SVG_BASELINE_KEY)
+      !hasChunkedPluginData(node, PAGE_SVG_BASELINE_KEY)
     ) {
-      node.setPluginData(
+      setChunkedPluginData(
+        node,
         PAGE_SVG_BASELINE_KEY,
         JSON.stringify(snapshotSvgSubtree(node)),
       );
     }
-    if (!node.getPluginData(PAGE_ANNOTATION_BASELINE_KEY)) {
-      node.setPluginData(
+    if (!hasChunkedPluginData(node, PAGE_ANNOTATION_BASELINE_KEY)) {
+      setChunkedPluginData(
+        node,
         PAGE_ANNOTATION_BASELINE_KEY,
         JSON.stringify(collectDirectFigmaAnnotations(node)),
       );
     }
   }
-  if (!root.getPluginData(PAGE_STRUCTURE_BASELINE_KEY)) {
-    root.setPluginData(
-      PAGE_STRUCTURE_BASELINE_KEY,
-      JSON.stringify(snapshotPageStructure(root)),
-    );
-  }
-  if (
+  const needsVectorMigration =
     root.getPluginData(PAGE_VECTOR_INSERT_VERSION_KEY) !==
-    VECTOR_INSERT_VERSION
-  ) {
-    root.setPluginData(
+    VECTOR_INSERT_VERSION;
+  if (needsVectorMigration) {
+    setChunkedPluginData(
+      root,
       PAGE_STRUCTURE_BASELINE_KEY,
       JSON.stringify(snapshotPageStructureWithoutUnmappedVectors(root)),
     );
     root.setPluginData(
       PAGE_VECTOR_INSERT_VERSION_KEY,
       VECTOR_INSERT_VERSION,
+    );
+  } else if (!hasChunkedPluginData(root, PAGE_STRUCTURE_BASELINE_KEY)) {
+    setChunkedPluginData(
+      root,
+      PAGE_STRUCTURE_BASELINE_KEY,
+      JSON.stringify(snapshotPageStructure(root)),
     );
   }
 }
@@ -1355,7 +1448,7 @@ function compareFigmaNodeIds(left, right) {
 function readPageStructureBaseline(root) {
   try {
     const parsed = JSON.parse(
-      root.getPluginData(PAGE_STRUCTURE_BASELINE_KEY) || "[]",
+      getChunkedPluginData(root, PAGE_STRUCTURE_BASELINE_KEY) || "[]",
     );
     return Array.isArray(parsed)
       ? collapseTrackedSvgDescendants(root, parsed)
@@ -1396,15 +1489,71 @@ function acceptPageChanges(message) {
   ) {
     return;
   }
+  const pendingSeed = pendingPageSeeds.get(message.changeSetId);
+  if (pendingSeed) {
+    clearTimeout(pendingSeed.timer);
+    pendingPageSeeds.delete(message.changeSetId);
+    if (
+      message.state !== "applied" ||
+      pendingSeed.pageId !== message.pageId ||
+      pendingSeed.root.removed
+    ) {
+      return;
+    }
+    setPageNodeData(
+      pendingSeed.root,
+      { pageId: pendingSeed.pageId, sourceHash: message.sourceHash },
+      pendingSeed.definition,
+      true,
+    );
+    for (const mapping of pendingSeed.mappings.slice(1)) {
+      if (!mapping.node.removed) {
+        setInsertedPageNodeData(
+          pendingSeed.root,
+          mapping.node,
+          mapping.nodeId,
+          mapping.pageNodeType,
+        );
+      }
+    }
+    storePageBaselines(pendingSeed.root);
+    indexCurrentPage();
+    reportPageStatus(true);
+    return;
+  }
   const root = findPageRoot(message.pageId);
+  const acceptedState = message.state || "applied";
   if (
     !root ||
-    root.getPluginData(SOURCE_HASH_KEY) !== message.sourceHash
+    acceptedState !== "applied" ||
+    root.getPluginData(SOURCE_HASH_KEY) !==
+      (message.previousSourceHash || message.sourceHash)
   ) {
     return;
   }
+  for (const node of findTrackedPageNodes(root)) {
+    node.setPluginData(SOURCE_HASH_KEY, message.sourceHash);
+  }
   storePageBaselines(root);
+  indexCurrentPage();
   reportPageStatus(true);
+}
+
+function abortPendingPageSeed(message) {
+  const changeSetId =
+    typeof message.changeSetId === "string" ? message.changeSetId : "";
+  const requestId =
+    typeof message.requestId === "string" ? message.requestId : "";
+  const pending = changeSetId
+    ? pendingPageSeeds.get(changeSetId)
+    : [...pendingPageSeeds.values()].find(
+        (candidate) => candidate.requestId === requestId,
+      );
+  if (!pending) {
+    return;
+  }
+  clearTimeout(pending.timer);
+  pendingPageSeeds.delete(pending.changeSetId);
 }
 
 function capturePagePreservedState(root) {
@@ -1814,6 +1963,16 @@ async function captureSelectedPageSeed(message) {
     throw new Error("请选择 Frame、Component、Instance 或 Group 作为完整页面。");
   }
 
+  if (message.pageSeedTransportVersion === PAGE_SEED_TRANSPORT_VERSION) {
+    await captureChunkedPageSeed({
+      pageId,
+      sourceHash,
+      requestId,
+      root,
+    });
+    return;
+  }
+
   const serialized = await serializeInsertedPageNode(root);
   const sourceRef = { selector: '[data-codex-id="page-root"]' };
   const definition = {
@@ -1873,6 +2032,130 @@ async function captureSelectedPageSeed(message) {
     count: 1,
   });
   reportPageStatus(true);
+}
+
+async function captureChunkedPageSeed({ pageId, sourceHash, requestId, root }) {
+  const serialized = await serializePageSeedRecords(root);
+  const chunks = chunkPageSeedRecords(serialized.records);
+  const sourceRef = { selector: '[data-codex-id="page-root"]' };
+  const rootRecord = serialized.records.find(
+    (record) => record.node.id === "page-root",
+  );
+  if (!rootRecord) {
+    throw new Error("The selected page does not contain a valid root frame.");
+  }
+  const changeSetId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const pending = {
+    requestId,
+    changeSetId,
+    pageId,
+    root,
+    definition: rootRecord.node,
+    mappings: serialized.mappings,
+    timer: null,
+  };
+  pending.timer = setTimeout(() => {
+    pendingPageSeeds.delete(changeSetId);
+  }, PAGE_SEED_PENDING_TIMEOUT_MS);
+  pendingPageSeeds.set(changeSetId, pending);
+
+  figma.ui.postMessage({
+    type: "page.seed.begin",
+    transportVersion: PAGE_SEED_TRANSPORT_VERSION,
+    requestId,
+    changeSetId,
+    pageId,
+    sourceHash,
+    nodeCount: serialized.records.length,
+    chunkCount: chunks.length,
+    rootNodeType: root.type,
+    rootNodeName: root.name,
+    figma: {
+      pageName: figma.currentPage.name,
+      rootNodeId: root.id,
+      rootNodeName: root.name,
+    },
+  });
+  for (let index = 0; index < chunks.length; index += 1) {
+    figma.ui.postMessage({
+      type: "page.seed.chunk",
+      transportVersion: PAGE_SEED_TRANSPORT_VERSION,
+      requestId,
+      changeSetId,
+      index,
+      records: chunks[index],
+    });
+  }
+  figma.ui.postMessage({
+    type: "page.seed.complete",
+    transportVersion: PAGE_SEED_TRANSPORT_VERSION,
+    requestId,
+    changeSetId,
+  });
+  figma.ui.postMessage({
+    type: "notice",
+    level: "info",
+    message: `Submitted ${serialized.records.length} page nodes in ${chunks.length} chunk(s).`,
+  });
+}
+
+function chunkPageSeedRecords(records) {
+  const chunks = [];
+  let chunk = [];
+  let chunkBytes = 2;
+  let totalBytes = 0;
+  for (const record of records) {
+    const recordBytes = utf8ByteLength(JSON.stringify(record));
+    if (recordBytes > PAGE_SEED_CHUNK_BYTES) {
+      throw new Error("A page node exceeds the 4 MB transport limit.");
+    }
+    if (
+      chunk.length > 0 &&
+      (chunk.length >= PAGE_SEED_CHUNK_NODE_LIMIT ||
+        chunkBytes + recordBytes + 1 > PAGE_SEED_CHUNK_BYTES)
+    ) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkBytes = 2;
+    }
+    chunk.push(record);
+    chunkBytes += recordBytes + 1;
+    totalBytes += recordBytes;
+    if (totalBytes > MAX_PAGE_SEED_TOTAL_BYTES) {
+      throw new Error("The page exceeds the 64 MB sync limit.");
+    }
+  }
+  if (chunk.length > 0) {
+    chunks.push(chunk);
+  }
+  if (chunks.length === 0 || chunks.length > MAX_PAGE_SEED_CHUNKS) {
+    throw new Error("The page requires too many transport chunks.");
+  }
+  return chunks;
+}
+
+function utf8ByteLength(value) {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 &&
+      value.charCodeAt(index + 1) <= 0xdfff
+    ) {
+      bytes += 4;
+      index += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 function pageStructureFingerprint(structure) {
@@ -2128,97 +2411,9 @@ async function serializeInsertedPageNode(rootNode) {
     if (state.count > MAX_INSERTED_PAGE_NODES) {
       throw new Error("The inserted subtree exceeds 200 nodes.");
     }
-    const pageNodeType = insertedPageNodeType(node);
-    if (!pageNodeType) {
-      throw new Error(`Unsupported inserted node type: ${node.type}`);
-    }
-    const nodeId = `figma-node-${normalizeNodeId(node.id)}`;
-    const sourceRef = {
-      selector: `[data-codex-id="${nodeId}"]`,
-    };
-    state.mappings.push({ node, nodeId, pageNodeType });
-    const properties = snapshotNodeProperties(node);
-    const definition = {
-      id: nodeId,
-      type: pageNodeType,
-      tag: insertedMarkupTag(node, pageNodeType),
-      name: node.name || nodeId,
-      sourceRef,
-      width: positivePageDimension(node.width),
-      height: positivePageDimension(node.height),
-      opacity:
-        Number.isFinite(node.opacity) && node.opacity >= 0 && node.opacity <= 1
-          ? round(node.opacity)
-          : 1,
-      visible: typeof node.visible === "boolean" ? node.visible : true,
-      rotation: Number.isFinite(node.rotation) ? round(node.rotation) : 0,
-      style: {
-        fill: properties.fill,
-        stroke: properties.stroke,
-        strokeWeight: properties.strokeWeight,
-        cornerRadius: properties.cornerRadius,
-      },
-      layoutItem: {
-        align: properties.layoutAlign === "STRETCH" ? "stretch" : "auto",
-        grow: Number.isFinite(properties.layoutGrow) ? properties.layoutGrow : 0,
-        shrink: 1,
-        basis: "auto",
-        order:
-          node.parent && "children" in node.parent
-            ? node.parent.children.indexOf(node)
-            : 0,
-        positioning:
-          properties.layoutPositioning === "ABSOLUTE" ? "absolute" : "auto",
-        horizontalSizing: String(
-          properties.layoutSizingHorizontal || "FIXED",
-        ).toLowerCase(),
-        verticalSizing: String(
-          properties.layoutSizingVertical || "FIXED",
-        ).toLowerCase(),
-      },
-    };
-    if (pageNodeType === "text") {
-      return {
-        ...definition,
-        text: typeof node.characters === "string" ? node.characters : "",
-        fontName: properties.fontName,
-        fontSize: properties.fontSize,
-        lineHeight: properties.lineHeight,
-        letterSpacing: properties.letterSpacing,
-        textAlignHorizontal: properties.textAlignHorizontal,
-        textAlignVertical: properties.textAlignVertical,
-        textCase: properties.textCase,
-        textDecoration: properties.textDecoration,
-      };
-    }
-    if (pageNodeType === "svg") {
-      const bytes = await node.exportAsync({
-        format: "SVG",
-        svgIdAttribute: true,
-      });
-      if (bytes.length === 0 || bytes.length > 768 * 1024) {
-        throw new Error("The inserted SVG exceeds the 768 KB sync limit.");
-      }
-      return {
-        ...definition,
-        svg: {
-          mimeType: "image/svg+xml",
-          base64: encodeBase64(bytes),
-        },
-      };
-    }
-    if (pageNodeType === "image") {
-      const bytes = await node.exportAsync({ format: "PNG" });
-      if (bytes.length === 0 || bytes.length > MAX_INSERTED_IMAGE_BYTES) {
-        throw new Error("The inserted image exceeds the 2 MB sync limit.");
-      }
-      return {
-        ...definition,
-        image: {
-          mimeType: "image/png",
-          base64: encodeBase64(bytes),
-        },
-      };
+    const definition = await serializeInsertedPageNodeDefinition(node, state);
+    if (definition.type !== "frame") {
+      return definition;
     }
     const children = [];
     if ("children" in node) {
@@ -2228,32 +2423,209 @@ async function serializeInsertedPageNode(rootNode) {
         }
       }
     }
-    return {
-      ...definition,
-      layout: {
-        kind: properties.layoutMode === "NONE" ? "none" : "flex",
-        mode: properties.layoutMode,
-        direction:
-          properties.layoutMode === "HORIZONTAL"
-            ? "horizontal"
-            : properties.layoutMode === "VERTICAL"
-              ? "vertical"
-              : "none",
-        wrap: properties.layoutWrap === "WRAP",
-        itemSpacing: properties.itemSpacing,
-        counterAxisSpacing: properties.counterAxisSpacing,
-        padding: properties.padding,
-        primaryAxisAlignItems: properties.primaryAxisAlignItems,
-        counterAxisAlignItems: properties.counterAxisAlignItems,
-        primaryAxisSizingMode: properties.primaryAxisSizingMode,
-        counterAxisSizingMode: properties.counterAxisSizingMode,
-      },
-      children,
-    };
+    return { ...definition, children };
   };
   return {
     definition: await visit(rootNode),
     mappings: state.mappings,
+  };
+}
+
+async function serializePageSeedRecords(rootNode) {
+  const state = { count: 0, mappings: [], records: [] };
+  const visit = async (node, parentId, index, isRoot = false) => {
+    state.count += 1;
+    if (state.count > MAX_PAGE_SEED_NODES) {
+      throw new Error(
+        `The selected page exceeds ${MAX_PAGE_SEED_NODES} editable nodes.`,
+      );
+    }
+    const nodeId = isRoot
+      ? "page-root"
+      : `figma-node-${normalizeNodeId(node.id)}`;
+    let definition = await serializeInsertedPageNodeDefinition(
+      node,
+      state,
+      nodeId,
+      isRoot ? "frame" : "",
+    );
+    if (isRoot) {
+      definition = { ...definition, type: "frame", tag: "main" };
+    }
+    state.records.push({ parentId, index, node: definition });
+    if (definition.type !== "frame" || !("children" in node)) {
+      return;
+    }
+    let childIndex = 0;
+    for (const child of node.children) {
+      if (!child.removed) {
+        await visit(child, nodeId, childIndex, false);
+        childIndex += 1;
+      }
+    }
+  };
+  await visit(rootNode, null, 0, true);
+  return state;
+}
+
+async function serializeInsertedPageNodeDefinition(
+  node,
+  state,
+  nodeIdOverride = "",
+  pageNodeTypeOverride = "",
+) {
+  const pageNodeType = pageNodeTypeOverride || insertedPageNodeType(node);
+  if (!pageNodeType) {
+    throw new Error(`Unsupported inserted node type: ${node.type}`);
+  }
+  const nodeId = nodeIdOverride || `figma-node-${normalizeNodeId(node.id)}`;
+  const sourceRef = {
+    selector: `[data-codex-id="${nodeId}"]`,
+  };
+  const mapping = { node, nodeId, pageNodeType };
+  state.mappings.push(mapping);
+  const properties = snapshotNodeProperties(node);
+  const definition = {
+    id: nodeId,
+    type: pageNodeType,
+    tag: insertedMarkupTag(node, pageNodeType),
+    name: node.name || nodeId,
+    sourceRef,
+    width: positivePageDimension(node.width),
+    height: positivePageDimension(node.height),
+    opacity:
+      Number.isFinite(node.opacity) && node.opacity >= 0 && node.opacity <= 1
+        ? round(node.opacity)
+        : 1,
+    visible: typeof node.visible === "boolean" ? node.visible : true,
+    rotation: Number.isFinite(node.rotation) ? round(node.rotation) : 0,
+    style: {
+      fill: properties.fill,
+      stroke: properties.stroke,
+      strokeWeight: properties.strokeWeight,
+      cornerRadius: properties.cornerRadius,
+    },
+    layoutItem: {
+      align: properties.layoutAlign === "STRETCH" ? "stretch" : "auto",
+      grow: Number.isFinite(properties.layoutGrow) ? properties.layoutGrow : 0,
+      shrink: 1,
+      basis: "auto",
+      order:
+        node.parent && "children" in node.parent
+          ? node.parent.children.indexOf(node)
+          : 0,
+      positioning:
+        properties.layoutPositioning === "ABSOLUTE" ? "absolute" : "auto",
+      horizontalSizing: String(
+        properties.layoutSizingHorizontal || "FIXED",
+      ).toLowerCase(),
+      verticalSizing: String(
+        properties.layoutSizingVertical || "FIXED",
+      ).toLowerCase(),
+    },
+  };
+  if (pageNodeType === "text") {
+    return {
+      ...definition,
+      text: typeof node.characters === "string" ? node.characters : "",
+      fontName: properties.fontName,
+      fontSize: properties.fontSize,
+      lineHeight: properties.lineHeight,
+      letterSpacing: properties.letterSpacing,
+      textAlignHorizontal: properties.textAlignHorizontal,
+      textAlignVertical: properties.textAlignVertical,
+      textCase: properties.textCase,
+      textDecoration: properties.textDecoration,
+    };
+  }
+  if (pageNodeType === "svg") {
+    try {
+      const bytes = await node.exportAsync({
+        format: "SVG",
+        svgIdAttribute: true,
+      });
+      if (bytes.length > 0 && bytes.length <= 768 * 1024) {
+        return {
+          ...definition,
+          svg: {
+            mimeType: "image/svg+xml",
+            base64: encodeBase64(bytes),
+          },
+        };
+      }
+    } catch {
+      // Some Figma nodes report no visible export layers even though their
+      // editable subtree is valid. Keep the page import moving as a frame.
+    }
+    mapping.pageNodeType = "frame";
+    return fallbackInsertedFrameDefinition(definition, properties, node);
+  }
+  if (pageNodeType === "image") {
+    try {
+      const bytes = await node.exportAsync({ format: "PNG" });
+      if (bytes.length > 0 && bytes.length <= MAX_INSERTED_IMAGE_BYTES) {
+        return {
+          ...definition,
+          image: {
+            mimeType: "image/png",
+            base64: encodeBase64(bytes),
+          },
+        };
+      }
+    } catch {
+      // Preserve the node geometry and any supported children when Figma
+      // cannot rasterize an invisible, clipped, or missing image fill.
+    }
+    mapping.pageNodeType = "frame";
+    return fallbackInsertedFrameDefinition(definition, properties, node);
+  }
+  return {
+    ...definition,
+    layout: insertedFrameLayout(properties),
+    children: [],
+  };
+}
+
+function fallbackInsertedFrameDefinition(definition, properties, node) {
+  return {
+    ...definition,
+    type: "frame",
+    tag: insertedMarkupTag(node, "frame"),
+    layout: insertedFrameLayout(properties),
+    children: [],
+  };
+}
+
+function insertedFrameLayout(properties) {
+  // GROUP nodes and several instance sublayers do not expose Figma's
+  // layoutMode property. They are valid non-auto-layout containers, so encode
+  // them as NONE instead of emitting the contradictory flex/null pair that
+  // the transactional Codex writer must reject.
+  const mode = ["HORIZONTAL", "VERTICAL"].includes(properties.layoutMode)
+    ? properties.layoutMode
+    : "NONE";
+  return {
+    kind:
+      properties.layoutKind === "grid"
+        ? "grid"
+        : mode === "NONE"
+          ? "none"
+          : "flex",
+    mode,
+    direction:
+      mode === "HORIZONTAL"
+        ? "horizontal"
+        : mode === "VERTICAL"
+          ? "vertical"
+          : "none",
+    wrap: properties.layoutWrap === "WRAP",
+    itemSpacing: properties.itemSpacing,
+    counterAxisSpacing: properties.counterAxisSpacing,
+    padding: properties.padding,
+    primaryAxisAlignItems: properties.primaryAxisAlignItems,
+    counterAxisAlignItems: properties.counterAxisAlignItems,
+    primaryAxisSizingMode: properties.primaryAxisSizingMode,
+    counterAxisSizingMode: properties.counterAxisSizingMode,
   };
 }
 
@@ -3467,11 +3839,194 @@ function readPageAnnotationBaseline(node) {
 
 function readJsonPluginData(node, key) {
   try {
-    const value = node.getPluginData(key);
+    const value = CHUNKABLE_PAGE_DATA_KEYS.has(key)
+      ? getChunkedPluginData(node, key)
+      : node.getPluginData(key);
     return value ? JSON.parse(value) : null;
   } catch {
     return null;
   }
+}
+
+function hasChunkedPluginData(node, key) {
+  return Boolean(getChunkedPluginData(node, key));
+}
+
+function getChunkedPluginData(node, key) {
+  const indexValue = node.getPluginData(key);
+  if (!indexValue) {
+    return "";
+  }
+  let index;
+  try {
+    index = JSON.parse(indexValue);
+  } catch {
+    return indexValue;
+  }
+  if (
+    !index ||
+    index.format !== CHUNKED_PLUGIN_DATA_FORMAT ||
+    index.version !== CHUNKED_PLUGIN_DATA_VERSION
+  ) {
+    return indexValue;
+  }
+  if (
+    typeof index.generation !== "string" ||
+    !/^[A-Za-z0-9_-]{1,64}$/.test(index.generation) ||
+    !Number.isInteger(index.chunks) ||
+    index.chunks < 1 ||
+    index.chunks > PLUGIN_DATA_CHUNK_MAX_COUNT ||
+    !Number.isInteger(index.bytes) ||
+    index.bytes < 0 ||
+    index.bytes > PLUGIN_DATA_CHUNK_MAX_TOTAL_BYTES
+  ) {
+    return "";
+  }
+  const parts = [];
+  for (let chunkIndex = 0; chunkIndex < index.chunks; chunkIndex += 1) {
+    const part = node.getPluginData(
+      chunkedPluginDataKey(key, index.generation, chunkIndex),
+    );
+    if (!part) {
+      return "";
+    }
+    parts.push(part);
+  }
+  const value = parts.join("");
+  return utf8ByteLength(value) === index.bytes ? value : "";
+}
+
+function setChunkedPluginData(node, key, value) {
+  const normalized = typeof value === "string" ? value : String(value ?? "");
+  const previous = readChunkedPluginDataIndex(node, key);
+  if (!normalized) {
+    node.setPluginData(key, "");
+    clearPluginDataGeneration(node, key, previous);
+    return;
+  }
+  const totalBytes = utf8ByteLength(normalized);
+  if (totalBytes > PLUGIN_DATA_CHUNK_MAX_TOTAL_BYTES) {
+    throw new Error("The page baseline exceeds the 64 MB plugin data limit.");
+  }
+  if (totalBytes <= PLUGIN_DATA_CHUNK_MAX_BYTES) {
+    node.setPluginData(key, normalized);
+    clearPluginDataGeneration(node, key, previous);
+    return;
+  }
+  const parts = splitUtf8String(normalized, PLUGIN_DATA_CHUNK_MAX_BYTES);
+  if (parts.length > PLUGIN_DATA_CHUNK_MAX_COUNT) {
+    throw new Error("The page baseline requires too many plugin data chunks.");
+  }
+  const generation = `${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+  const writtenKeys = [];
+  try {
+    for (let chunkIndex = 0; chunkIndex < parts.length; chunkIndex += 1) {
+      const partKey = chunkedPluginDataKey(key, generation, chunkIndex);
+      node.setPluginData(partKey, parts[chunkIndex]);
+      writtenKeys.push(partKey);
+    }
+    node.setPluginData(
+      key,
+      JSON.stringify({
+        format: CHUNKED_PLUGIN_DATA_FORMAT,
+        version: CHUNKED_PLUGIN_DATA_VERSION,
+        generation,
+        chunks: parts.length,
+        bytes: totalBytes,
+      }),
+    );
+  } catch (error) {
+    for (const writtenKey of writtenKeys) {
+      try {
+        node.setPluginData(writtenKey, "");
+      } catch {
+        // Keep the previous index active if cleanup itself is unavailable.
+      }
+    }
+    throw error;
+  }
+  clearPluginDataGeneration(node, key, previous);
+}
+
+function clearChunkedPluginData(node, key) {
+  const previous = readChunkedPluginDataIndex(node, key);
+  node.setPluginData(key, "");
+  clearPluginDataGeneration(node, key, previous);
+}
+
+function readChunkedPluginDataIndex(node, key) {
+  const value = node.getPluginData(key);
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return parsed?.format === CHUNKED_PLUGIN_DATA_FORMAT ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPluginDataGeneration(node, key, index) {
+  if (
+    !index ||
+    typeof index.generation !== "string" ||
+    !Number.isInteger(index.chunks) ||
+    index.chunks < 1 ||
+    index.chunks > PLUGIN_DATA_CHUNK_MAX_COUNT
+  ) {
+    return;
+  }
+  for (let chunkIndex = 0; chunkIndex < index.chunks; chunkIndex += 1) {
+    node.setPluginData(
+      chunkedPluginDataKey(key, index.generation, chunkIndex),
+      "",
+    );
+  }
+}
+
+function chunkedPluginDataKey(key, generation, chunkIndex) {
+  return `${key}__chunk__${generation}__${chunkIndex}`;
+}
+
+function splitUtf8String(value, maxBytes) {
+  const parts = [];
+  let start = 0;
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    let characterBytes;
+    let characterLength = 1;
+    if (code < 0x80) {
+      characterBytes = 1;
+    } else if (code < 0x800) {
+      characterBytes = 2;
+    } else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 &&
+      value.charCodeAt(index + 1) <= 0xdfff
+    ) {
+      characterBytes = 4;
+      characterLength = 2;
+    } else {
+      characterBytes = 3;
+    }
+    if (bytes > 0 && bytes + characterBytes > maxBytes) {
+      parts.push(value.slice(start, index));
+      start = index;
+      bytes = 0;
+    }
+    bytes += characterBytes;
+    if (characterLength === 2) {
+      index += 1;
+    }
+  }
+  parts.push(value.slice(start));
+  return parts;
 }
 
 function diffObject(before, after) {

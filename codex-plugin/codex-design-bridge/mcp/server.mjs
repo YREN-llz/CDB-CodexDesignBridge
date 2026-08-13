@@ -20,7 +20,12 @@ import {
   captureLocalPreviewImage,
 } from "./browser-capture.mjs";
 import { LocalFigmaBridge } from "./local-figma-bridge.mjs";
-import { undoLastPatchTransaction } from "./patch-transaction.mjs";
+import { chooseLocalProjectLocation } from "./local-directory-picker.mjs";
+import { verifyPageChange } from "./page-change-compare.mjs";
+import {
+  undoLastPatchTransaction,
+  undoPatchTransactionById,
+} from "./patch-transaction.mjs";
 import {
   applyDesignPreflightFixes,
   createDesignProject,
@@ -32,6 +37,7 @@ import {
   workspacePagesFromReport,
   writeImportedManifest,
 } from "./project-contract.mjs";
+import { ProjectRegistry } from "./project-registry.mjs";
 import { WorkspaceLeaseManager } from "./workspace-lease.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -56,13 +62,21 @@ const previews = new Map();
 const figmaBridges = new Map();
 const launcherStates = new Map();
 const bindingWriteQueues = new Map();
+const workspaceRecoveryPromises = new Map();
+const workspaceClosing = new Set();
 let activeProject = "";
+let workspaceOpenQueue = Promise.resolve();
 let uiHtmlPromise;
 
 const leaseRoot = process.env.CODEX_DESIGN_BRIDGE_LEASE_ROOT ||
   (process.env.CODEX_DESIGN_BRIDGE_PORT === "0"
     ? path.join(tmpdir(), `cdb-design-bridge-test-${process.pid}`)
     : path.join(tmpdir(), "cdb-design-bridge"));
+const projectRegistryPath = process.env.CODEX_DESIGN_BRIDGE_PROJECT_REGISTRY ||
+  (process.env.CODEX_DESIGN_BRIDGE_PORT === "0"
+    ? path.join(leaseRoot, "projects.json")
+    : path.join(homedir(), ".codex", "cdb", "projects.json"));
+const projectRegistry = new ProjectRegistry({ filePath: projectRegistryPath });
 const leaseManager = new WorkspaceLeaseManager({
   leaseRoot,
   getStatus: () => {
@@ -133,6 +147,114 @@ const tools = [
       readOnlyHint: true,
       destructiveHint: false,
       openWorldHint: false,
+    },
+  },
+  {
+    name: "choose_local_project_location",
+    title: "Choose a local CDB project location",
+    description:
+      "Open the operating system folder picker after an explicit user action and return the selected parent directory without creating files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        initialDir: {
+          type: "string",
+          description: "Optional existing directory shown first by the picker.",
+        },
+        purpose: {
+          type: "string",
+          enum: ["design", "figma", "open"],
+          description: "Whether the selected folder will contain a new project or is an existing CDB project to open.",
+        },
+      },
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+    _meta: {
+      "ui.resourceUri": UI_URI,
+      "openai/outputTemplate": UI_URI,
+      "openai/toolInvocation/invoking": "正在选择本地位置",
+      "openai/toolInvocation/invoked": "本地位置选择已完成",
+    },
+  },
+  {
+    name: "list_design_projects",
+    title: "List managed CDB projects",
+    description:
+      "List only CDB projects that were explicitly created or opened by this user. This never scans the filesystem.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+    _meta: {
+      "ui.resourceUri": UI_URI,
+      "openai/outputTemplate": UI_URI,
+    },
+  },
+  {
+    name: "open_registered_design_project",
+    title: "Switch to a managed CDB project",
+    description:
+      "Resolve a project from the user project registry, rerun preflight, and safely switch the active CDB workspace.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectKey: {
+          type: "string",
+          minLength: 8,
+          maxLength: 128,
+        },
+      },
+      required: ["projectKey"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+    _meta: {
+      "ui.resourceUri": UI_URI,
+      "openai/outputTemplate": UI_URI,
+      "openai/toolInvocation/invoking": "正在切换 CDB 项目",
+      "openai/toolInvocation/invoked": "CDB 项目已切换",
+    },
+  },
+  {
+    name: "forget_design_project",
+    title: "Remove a CDB project from the list",
+    description:
+      "Remove one project from the CDB project list without deleting or modifying any project files.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectKey: {
+          type: "string",
+          minLength: 8,
+          maxLength: 128,
+        },
+      },
+      required: ["projectKey"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+    _meta: {
+      "ui.resourceUri": UI_URI,
+      "openai/outputTemplate": UI_URI,
     },
   },
   {
@@ -674,6 +796,25 @@ async function callTool(name, args) {
       const state = await resolveDesignSource(args);
       return toolResult(state, state.message);
     }
+    case "choose_local_project_location": {
+      const selection = await chooseLocalProjectLocation(args);
+      return locationSelectionResult(selection);
+    }
+    case "list_design_projects": {
+      const projectCatalog = await listRegisteredProjects();
+      return projectCatalogResult(projectCatalog, "CDB 项目列表已刷新。");
+    }
+    case "open_registered_design_project": {
+      const state = await openRegisteredProject(args.projectKey);
+      return toolResult(state, "CDB 项目已切换。");
+    }
+    case "forget_design_project": {
+      const projectCatalog = await forgetRegisteredProject(args.projectKey);
+      return projectCatalogResult(
+        projectCatalog,
+        "项目已从 CDB 列表移出；本地项目文件没有删除或修改。",
+      );
+    }
     case "create_design_project": {
       const created = await createDesignProject(args);
       const state = await openWorkspace({ projectDir: created.projectDir });
@@ -702,7 +843,8 @@ async function callTool(name, args) {
       return toolResult(state, "设计工作台已就绪。");
     }
     case "get_design_workspace_state": {
-      const state = await getWorkspace(args.projectDir);
+      const current = await getWorkspace(args.projectDir);
+      const state = await recoverWorkspaceResources(args.projectDir, current);
       return toolResult(state, state.message);
     }
     case "open_design_preview_in_browser": {
@@ -764,6 +906,76 @@ async function callTool(name, args) {
   }
 }
 
+async function registerProjectDescriptor(descriptor) {
+  return projectRegistry.upsert({
+    projectKey: descriptor.projectKey,
+    projectId: descriptor.manifest.projectId || "",
+    name: descriptor.manifest.name || path.basename(descriptor.rootDir),
+    projectDir: descriptor.rootDir,
+    sourceKind: descriptor.manifest.source?.kind || "",
+  });
+}
+
+async function listRegisteredProjects() {
+  const registered = await projectRegistry.list();
+  const activeComparable = activeProject
+    ? path.resolve(activeProject).toLowerCase()
+    : "";
+  return Promise.all(registered.map(async (record) => {
+    try {
+      const descriptor = await loadProjectDescriptor(record.projectDir);
+      const identityMatches = descriptor.projectKey === record.projectKey;
+      return {
+        projectKey: record.projectKey,
+        projectId: descriptor.manifest.projectId || record.projectId || "",
+        name:
+          descriptor.manifest.name || record.name || path.basename(record.projectDir),
+        projectDir: descriptor.rootDir,
+        sourceKind:
+          descriptor.manifest.source?.kind || record.sourceKind || "",
+        lastOpenedAt: record.lastOpenedAt,
+        status: identityMatches ? "available" : "identity_changed",
+        active:
+          identityMatches &&
+          descriptor.rootDir.toLowerCase() === activeComparable,
+      };
+    } catch {
+      return {
+        ...record,
+        status: "missing",
+        active: false,
+      };
+    }
+  }));
+}
+
+async function openRegisteredProject(projectKey) {
+  const registered = await projectRegistry.find(projectKey);
+  if (!registered) {
+    throw new Error("这个项目不在 CDB 项目列表中，请重新选择本地项目目录。");
+  }
+  let descriptor;
+  try {
+    descriptor = await loadProjectDescriptor(registered.projectDir);
+  } catch {
+    throw new Error(
+      "项目位置已失效或不再是可用的 CDB 项目，请重新选择本地目录。",
+    );
+  }
+  if (descriptor.projectKey !== registered.projectKey) {
+    throw new Error("项目身份已经变化，请移出旧记录后重新打开本地项目。");
+  }
+  return openWorkspace({ projectDir: descriptor.rootDir });
+}
+
+async function forgetRegisteredProject(projectKey) {
+  await projectRegistry.forget(projectKey);
+  const projectCatalog = await listRegisteredProjects();
+  for (const state of states.values()) state.projectCatalog = projectCatalog;
+  for (const state of launcherStates.values()) state.projectCatalog = projectCatalog;
+  return projectCatalog;
+}
+
 async function openDesignLauncher({ workspaceDir } = {}) {
   let destination = "";
   if (typeof workspaceDir === "string" && workspaceDir.trim()) {
@@ -778,7 +990,9 @@ async function openDesignLauncher({ workspaceDir } = {}) {
     launcherId,
     workspaceDir: destination,
     projectDir: "",
+    projectKey: "",
     projectName: "CDB",
+    projectCatalog: await listRegisteredProjects(),
     pages: [],
     activePageId: "",
     phase: "launcher_ready",
@@ -925,18 +1139,31 @@ function publicPreflightReport(report) {
   };
 }
 
-async function openWorkspace({ projectDir, previewUrl }) {
+function openWorkspace(args) {
+  const operation = workspaceOpenQueue.then(
+    () => openWorkspaceExclusive(args),
+    () => openWorkspaceExclusive(args),
+  );
+  workspaceOpenQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+async function openWorkspaceExclusive({ projectDir, previewUrl }) {
   const startedAt = Date.now();
   const project = await normalizeProjectDir(projectDir);
+  workspaceClosing.delete(project);
   const report = await preflightDesignProject(project);
+  await registerProjectDescriptor(report.descriptor);
   let state = await getWorkspace(project, report);
   state = {
     ...state,
     mode: "workspace",
+    projectKey: report.projectKey,
     projectName: report.descriptor.manifest.name || path.basename(project),
     pages: workspacePagesFromReport(report, state.pages),
     preflightReport: publicPreflightReport(report),
   };
+  state.figmaReady = state.pages.some((page) => page.figmaReady);
   state.activePageId = state.pages.some(
     (page) => page.id === state.activePageId,
   )
@@ -947,6 +1174,7 @@ async function openWorkspace({ projectDir, previewUrl }) {
       ...stateFromPreflight(report, state),
       importSummary: state.importSummary || null,
     };
+    state.projectCatalog = await listRegisteredProjects();
     states.set(project, state);
     return publicState(state);
   }
@@ -997,6 +1225,7 @@ async function openWorkspace({ projectDir, previewUrl }) {
     };
   }
   state.phase = "opening";
+  state.projectCatalog = await listRegisteredProjects();
   state.sessionActive = true;
   state.needsEndConfirmation = false;
   state.needsHandoffConfirmation = false;
@@ -1059,21 +1288,24 @@ async function getWorkspace(projectDir, preparedReport = null) {
   const binding = await readBinding(project);
   const report = preparedReport || await preflightDesignProject(project);
   const pages = workspacePagesFromReport(report, binding.pages);
+  const figmaReady = pages.some((page) => page.figmaReady);
   const activePageId = pages.some((page) => page.id === binding.activePageId)
     ? binding.activePageId
     : pages[0]?.id || "";
   const state = {
     mode: "workspace",
     projectDir: project,
+    projectKey: report.projectKey,
     projectName: report.descriptor.manifest.name || path.basename(project),
+    projectCatalog: await listRegisteredProjects(),
     pages,
     activePageId,
-    phase: binding.figmaReady || binding.figmaUrl ? "in_figma" : "ready",
+    phase: figmaReady || binding.figmaUrl ? "in_figma" : "ready",
     sessionActive: true,
     previewUrl: "",
     previewRevision: 0,
     figmaUrl: "",
-    figmaReady: Boolean(binding.figmaReady || binding.figmaUrl),
+    figmaReady: Boolean(figmaReady || binding.figmaUrl),
     figmaConnected: false,
     bridgeReady: false,
     unsentChanges: false,
@@ -1081,7 +1313,7 @@ async function getWorkspace(projectDir, preparedReport = null) {
     needsHandoffConfirmation: false,
     lastFigmaConnectedAt: "",
     connectionIssue: "",
-    message: binding.figmaReady || binding.figmaUrl
+    message: figmaReady || binding.figmaUrl
       ? "可以检查 Figma 中的最新修改。"
       : "可以开始预览并在 Figma 中继续设计。",
     changeCount: binding.changeCount || 0,
@@ -1128,6 +1360,7 @@ function synchronizeBridgeState(projectDir, state) {
       page.syncState !== state.pages[index]?.syncState ||
       page.figmaReady !== state.pages[index]?.figmaReady,
   );
+  const figmaReady = pages.some((page) => page.figmaReady);
   const versionMismatch = status.lastError === "version_mismatch";
   const connectedAt =
     status.connected && !state.figmaConnected
@@ -1140,6 +1373,7 @@ function synchronizeBridgeState(projectDir, state) {
     state.lastFigmaConnectedAt === connectedAt &&
     state.figmaPluginVersion === figmaPluginVersion &&
     state.connectionIssue === (versionMismatch ? "version_mismatch" : "") &&
+    state.figmaReady === figmaReady &&
     !pageStateChanged
   ) {
     return state;
@@ -1147,6 +1381,7 @@ function synchronizeBridgeState(projectDir, state) {
   const updated = {
     ...state,
     pages,
+    figmaReady,
     bridgeReady: true,
     figmaConnected: status.connected,
     figmaPluginVersion,
@@ -1170,6 +1405,92 @@ function synchronizeBridgeState(projectDir, state) {
   };
   states.set(projectDir, updated);
   return updated;
+}
+
+async function recoverWorkspaceResources(projectDir, state) {
+  const project = await normalizeProjectDir(projectDir);
+  if (
+    workspaceClosing.has(project) ||
+    !state.sessionActive ||
+    activeProject !== project ||
+    !leaseManager.status().owned
+  ) {
+    return state;
+  }
+  const existingRecovery = workspaceRecoveryPromises.get(project);
+  if (existingRecovery) return existingRecovery;
+
+  const recovery = (async () => {
+    if (workspaceClosing.has(project)) return states.get(project) || state;
+    const current = synchronizeBridgeState(project, states.get(project) || state);
+    const preview = previews.get(project);
+    const previewReady = Boolean(preview && (await isReachable(preview.url)));
+    const bridge = figmaBridges.get(project);
+    const bridgeReady = Boolean(bridge?.status().listening);
+    const updatedAt = Date.parse(current.updatedAt || "");
+    const staleBusyPhase =
+      ["opening", "preparing_figma", "applying"].includes(current.phase) &&
+      (!Number.isFinite(updatedAt) || Date.now() - updatedAt > 15_000);
+    if (previewReady && bridgeReady && !staleBusyPhase) return current;
+
+    try {
+      if (workspaceClosing.has(project) || activeProject !== project) {
+        return states.get(project) || current;
+      }
+      const healthyPreview = previewReady
+        ? preview
+        : await ensurePreview(project, current.previewUrl);
+      const healthyBridge = bridgeReady
+        ? bridge
+        : await ensureLocalFigmaBridge(project);
+      const updated = {
+        ...current,
+        phase: staleBusyPhase
+          ? current.figmaReady || current.figmaUrl
+            ? "in_figma"
+            : "ready"
+          : current.phase,
+        previewUrl: healthyPreview.url,
+        previewRevision:
+          current.previewRevision + (previewReady ? 0 : 1),
+        bridgeReady: true,
+        figmaConnected: healthyBridge.status().connected,
+        connectionIssue: "",
+        message:
+          !previewReady || !bridgeReady
+            ? "预览与 Figma 本地连接已自动恢复。"
+            : current.message,
+        updatedAt: new Date().toISOString(),
+      };
+      states.set(project, updated);
+      await writeBinding(project, updated);
+      return synchronizeBridgeState(project, updated);
+    } catch (error) {
+      // A recovery can be cancelled while its async preview/bridge startup is
+      // still unwinding. Never let that cancelled task overwrite the terminal
+      // state written by the project switch.
+      if (workspaceClosing.has(project) || activeProject !== project) {
+        return states.get(project) || current;
+      }
+      const updated = {
+        ...current,
+        phase: "error",
+        bridgeReady: false,
+        message: friendlyError(error),
+        updatedAt: new Date().toISOString(),
+      };
+      states.set(project, updated);
+      return updated;
+    }
+  })();
+  workspaceRecoveryPromises.set(project, recovery);
+  try {
+    return await recovery;
+  } finally {
+    if (workspaceRecoveryPromises.get(project) === recovery) {
+      workspaceRecoveryPromises.delete(project);
+    }
+  }
 }
 
 async function refreshWorkspace(projectDir) {
@@ -1217,6 +1538,14 @@ async function endDesignSession(projectDir, force = false) {
   const project = await normalizeProjectDir(projectDir);
   let state = await getWorkspace(project);
   if (!state.sessionActive) {
+    if (previews.has(project) || figmaBridges.has(project)) {
+      await shutdownWorkspaceResources(project, {
+        force: true,
+        handoff: false,
+        releaseLease: activeProject === project,
+      });
+      state = states.get(project) || state;
+    }
     return publicState(state);
   }
 
@@ -1279,7 +1608,67 @@ async function clearFigmaLinksForWorkspace(projectDir) {
   };
   states.set(project, updated);
   await writeBinding(project, updated);
-  return publicState(updated);
+  return updated.pages;
+}
+
+async function createFigmaProjectFromPlugin({ projectName = "Figma Design" } = {}) {
+  const selection = await chooseLocalProjectLocation({
+    initialDir: activeProject ? path.dirname(activeProject) : "",
+    purpose: "figma",
+  });
+  if (!selection.selected) return { cancelled: true };
+  const created = await createFigmaSeedProject({
+    workspaceDir: selection.path,
+    projectName,
+  });
+  const descriptor = created.descriptor || await loadProjectDescriptor(created.projectDir);
+  await registerProjectDescriptor(descriptor);
+  return {
+    cancelled: false,
+    projectKey: descriptor.projectKey,
+    projectDir: descriptor.rootDir,
+    start: () => queueWorkspaceOpen(descriptor.rootDir, "Figma-created project"),
+  };
+}
+
+async function queueRegisteredProjectOpenFromPlugin(projectKey) {
+  const registered = await projectRegistry.find(projectKey);
+  if (!registered) {
+    throw new Error("这个项目不在 CDB 项目列表中，请刷新后重试。");
+  }
+  let report;
+  try {
+    report = await preflightDesignProject(registered.projectDir);
+  } catch {
+    throw new Error("项目位置已失效或不再是可用的 CDB 项目。");
+  }
+  if (report.projectKey !== registered.projectKey) {
+    throw new Error("项目身份已经变化，请在 Codex 端重新登记这个项目。");
+  }
+  if (["blocker", "safe_fix"].includes(report.status)) {
+    throw new Error(
+      report.status === "safe_fix"
+        ? "目标项目需要先在 Codex 端完成安全修复，当前项目仍保持打开。"
+        : "目标项目预检未通过，请先在 Codex 端处理阻断问题。",
+    );
+  }
+  return {
+    projectKey: report.projectKey,
+    projectDir: report.descriptor.rootDir,
+    start: () => queueWorkspaceOpen(report.descriptor.rootDir, "Figma project switch"),
+  };
+}
+
+function queueWorkspaceOpen(projectDir, label) {
+  setImmediate(() => {
+    void openWorkspace({ projectDir }).catch((error) => {
+      console.error(
+        `[CDB] ${label} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  });
 }
 
 async function shutdownWorkspaceResources(
@@ -1287,13 +1676,8 @@ async function shutdownWorkspaceResources(
   { handoff = false, releaseLease = false } = {},
 ) {
   const state = states.get(project) || (await getWorkspace(project));
-  const preview = previews.get(project);
-  const bridge = figmaBridges.get(project);
-  previews.delete(project);
-  figmaBridges.delete(project);
-  await Promise.allSettled(
-    [preview?.stop(), bridge?.endSession()].filter(Boolean),
-  );
+  workspaceClosing.add(project);
+  await stopWorkspaceRuntimeResources(project);
   const updated = {
     ...state,
     phase: "ended",
@@ -1315,6 +1699,22 @@ async function shutdownWorkspaceResources(
   if (activeProject === project) activeProject = "";
   if (releaseLease) await leaseManager.release();
   return updated;
+}
+
+async function stopWorkspaceRuntimeResources(project) {
+  // A recovery that started before the closing barrier may have published new
+  // resources after the first snapshot. Drain until the maps stay empty.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const preview = previews.get(project);
+    const bridge = figmaBridges.get(project);
+    previews.delete(project);
+    figmaBridges.delete(project);
+    await Promise.allSettled(
+      [preview?.stop(), bridge?.endSession()].filter(Boolean),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    if (!previews.has(project) && !figmaBridges.has(project)) return;
+  }
 }
 
 async function getDesignPreviewImage({ projectDir, width, height, pageId }) {
@@ -1371,15 +1771,13 @@ async function openLocalUrlInDefaultBrowser(url) {
     return;
   }
 
-  const launch =
-    process.platform === "win32"
-      ? {
-          command: "rundll32.exe",
-          args: ["url.dll,FileProtocolHandler", url],
-        }
-      : process.platform === "darwin"
-        ? { command: "open", args: [url] }
-        : { command: "xdg-open", args: [url] };
+  const launch = defaultBrowserLaunch(url);
+  const launchCapturePath =
+    process.env.CODEX_DESIGN_BRIDGE_BROWSER_LAUNCH_CAPTURE_PATH;
+  if (launchCapturePath) {
+    await writeFile(launchCapturePath, JSON.stringify(launch), "utf8");
+    return;
+  }
 
   await new Promise((resolve, reject) => {
     const child = spawn(launch.command, launch.args, {
@@ -1393,6 +1791,20 @@ async function openLocalUrlInDefaultBrowser(url) {
       resolve();
     });
   });
+}
+
+function defaultBrowserLaunch(url) {
+  if (process.platform === "win32") {
+    const windowsRoot =
+      process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+    return {
+      command: path.join(windowsRoot, "System32", "rundll32.exe"),
+      args: ["url.dll,FileProtocolHandler", url],
+    };
+  }
+  return process.platform === "darwin"
+    ? { command: "open", args: [url] }
+    : { command: "xdg-open", args: [url] };
 }
 
 async function manageWorkspacePage(args) {
@@ -1764,6 +2176,8 @@ async function sendPreviewToLocalFigma(projectDir, pageIds) {
           previewUrl: routeUrl,
           projectDir: project,
           captureState: page.captureState,
+          width: page.viewport?.width,
+          height: page.viewport?.height,
         });
         captured.manifest.pageId = page.id;
         captured.manifest.name = `${state.projectName} · ${page.name}`;
@@ -1940,6 +2354,9 @@ async function captureLocalFigmaChanges(projectDir) {
 }
 
 async function ensureLocalFigmaBridge(projectDir) {
+  if (workspaceClosing.has(projectDir) || activeProject !== projectDir) {
+    throw new Error("当前项目正在切换，已停止恢复旧的 Figma 连接。");
+  }
   const workspace = states.get(projectDir);
   const identity = {
     projectName: workspace?.projectName || path.basename(projectDir),
@@ -1947,9 +2364,13 @@ async function ensureLocalFigmaBridge(projectDir) {
   };
   const existing = figmaBridges.get(projectDir);
   if (existing) {
-    existing.setWorkspaceIdentity(identity);
-    existing.setPageCatalog(states.get(projectDir)?.pages || []);
-    return existing;
+    if (existing.status().listening) {
+      existing.setWorkspaceIdentity(identity);
+      existing.setPageCatalog(states.get(projectDir)?.pages || []);
+      return existing;
+    }
+    await existing.stop().catch(() => {});
+    figmaBridges.delete(projectDir);
   }
   const configuredPort = Number.parseInt(
     process.env.CODEX_DESIGN_BRIDGE_PORT || "9847",
@@ -1959,10 +2380,14 @@ async function ensureLocalFigmaBridge(projectDir) {
     port: Number.isFinite(configuredPort) ? configuredPort : 9847,
     runtimeVersion: PLUGIN_VERSION,
     ...identity,
+    onPrepareApply: (context) => prepareFastApply(projectDir, context),
     onFastApply: (result) => recordFastApply(projectDir, result),
     onImportPages: (pageIds) =>
       sendPreviewToLocalFigma(projectDir, pageIds),
     onResetWorkspace: () => clearFigmaLinksForWorkspace(projectDir),
+    onListProjects: () => listRegisteredProjects(),
+    onOpenProject: (projectKey) => queueRegisteredProjectOpenFromPlugin(projectKey),
+    onCreateFigmaProject: (options) => createFigmaProjectFromPlugin(options),
   });
   try {
     await bridge.start();
@@ -1974,16 +2399,79 @@ async function ensureLocalFigmaBridge(projectDir) {
     }
     throw error;
   }
+  if (workspaceClosing.has(projectDir) || activeProject !== projectDir) {
+    await bridge.stop().catch(() => {});
+    throw new Error("当前项目正在切换，已停止恢复旧的 Figma 连接。");
+  }
   bridge.setPageCatalog(states.get(projectDir)?.pages || []);
   figmaBridges.set(projectDir, bridge);
   return bridge;
 }
 
+async function prepareFastApply(
+  projectDir,
+  { pageId, changeSet, manifest, baselineSourceHash = "" } = {},
+) {
+  const current = await getWorkspace(projectDir);
+  const page = current.pages.find((entry) => entry.id === pageId);
+  if (!page) {
+    throw Object.assign(new Error("无法定位待更新页面。"), {
+      code: "current_page_missing",
+    });
+  }
+  const report = await preflightDesignProject(projectDir);
+  if (["blocker", "safe_fix"].includes(report.status)) {
+    throw Object.assign(new Error("项目预检未通过，源码保持原样。"), {
+      code: "preapply_preflight_failed",
+    });
+  }
+  const reportPage = report.pages.find((entry) => entry.id === pageId);
+  if (!reportPage) {
+    throw Object.assign(new Error("预检报告中缺少待更新页面。"), {
+      code: "preapply_page_missing",
+    });
+  }
+  const currentSourceHash = reportPage.sourceHash || "";
+  const needsCurrentManifest =
+    !baselineSourceHash ||
+    baselineSourceHash !== currentSourceHash ||
+    !manifest ||
+    manifest.sourceHash !== changeSet?.sourceHash;
+  if (!needsCurrentManifest) {
+    return { currentSourceHash };
+  }
+  const preview = await ensurePreview(projectDir, current.previewUrl);
+  const captured = await captureLocalPreview({
+    previewUrl: previewUrlForPage(preview.url, page.path),
+    projectDir,
+    captureState: page.captureState,
+    width: page.viewport?.width,
+    height: page.viewport?.height,
+  });
+  captured.manifest.pageId = page.id;
+  captured.manifest.name = `${current.projectName} · ${page.name}`;
+  captured.manifest.source = {
+    ...(captured.manifest.source || {}),
+    file: previewUrlForPage(preview.url, page.path),
+    previewUrl: previewUrlForPage(preview.url, page.path),
+  };
+  return {
+    currentManifest: captured.manifest,
+    currentSourceHash,
+  };
+}
+
 async function recordFastApply(projectDir, result) {
   const current = await getWorkspace(projectDir);
   const fastApply = result.fastApply || {};
+  let verifiedManifest = null;
   if ((fastApply.pendingCount || 0) === 0 && (fastApply.appliedCount || 0) > 0) {
-    await verifyFastApply(projectDir, current, result, fastApply);
+    verifiedManifest = await verifyFastApply(
+      projectDir,
+      current,
+      result,
+      fastApply,
+    );
   }
   const appliedCount = fastApply.appliedCount || 0;
   const pendingCount = fastApply.pendingCount || 0;
@@ -1994,17 +2482,27 @@ async function recordFastApply(projectDir, result) {
   const changedFiles = Array.isArray(fastApply.changedFiles)
     ? fastApply.changedFiles
     : [];
+  let pages = current.pages;
+  let preflightReport = current.preflightReport;
+  if (appliedCount > 0) {
+    const refreshedReport = await preflightDesignProject(projectDir);
+    pages = workspacePagesFromReport(refreshedReport, current.pages);
+    preflightReport = publicPreflightReport(refreshedReport);
+  }
+  pages = pages.map((page) =>
+    page.id === result.pageId
+      ? {
+          ...page,
+          figmaReady: true,
+          syncState: pendingCount > 0 ? "conflict" : "synced",
+        }
+      : page,
+  );
   const state = {
     ...current,
-    pages: current.pages.map((page) =>
-      page.id === result.pageId
-        ? {
-            ...page,
-            figmaReady: true,
-            syncState: pendingCount > 0 ? "conflict" : "synced",
-          }
-        : page,
-    ),
+    pages,
+    figmaReady: pages.some((page) => page.figmaReady),
+    preflightReport,
     phase: pendingCount > 0 ? "in_figma" : "complete",
     figmaConnected: true,
     bridgeReady: true,
@@ -2034,8 +2532,10 @@ async function recordFastApply(projectDir, result) {
   states.set(projectDir, state);
   figmaBridges.get(projectDir)?.setPageCatalog(state.pages);
   return {
-    sourceHash:
+    projectSourceHash:
       state.pages.find((page) => page.id === result.pageId)?.sourceHash || "",
+    sourceHash: verifiedManifest?.sourceHash || "",
+    pageManifest: verifiedManifest,
     fastApply,
   };
 }
@@ -2044,13 +2544,6 @@ async function verifyFastApply(projectDir, current, result, fastApply) {
   const changes = Array.isArray(result.changeSet?.changes)
     ? result.changeSet.changes
     : [];
-  const structural = changes.filter((change) =>
-    ["nodeMove", "nodeReparent"].includes(change?.property),
-  );
-  if (structural.length === 0) {
-    fastApply.verification = { status: "not_required" };
-    return;
-  }
   try {
     const report = await preflightDesignProject(projectDir);
     if (["blocker", "safe_fix"].includes(report.status)) {
@@ -2069,53 +2562,56 @@ async function verifyFastApply(projectDir, current, result, fastApply) {
       previewUrl: previewUrlForPage(preview.url, page.path),
       projectDir,
       captureState: page.captureState,
+      width: page.viewport?.width,
+      height: page.viewport?.height,
     });
+    captured.manifest.pageId = page.id;
+    captured.manifest.name = `${current.projectName} · ${page.name}`;
+    captured.manifest.source = {
+      ...(captured.manifest.source || {}),
+      file: previewUrlForPage(preview.url, page.path),
+      previewUrl: previewUrlForPage(preview.url, page.path),
+    };
     let maxPositionErrorPx = 0;
-    for (const change of structural) {
-      const located = findCapturedNode(captured.manifest.root, change.nodeId);
-      if (!located) {
-        throw Object.assign(
-          new Error(`验证页面中缺少节点：${change.nodeId}`),
-          { code: "verification_node_missing" },
-        );
+    let verifiedCount = 0;
+    let skippedCount = 0;
+    for (const change of changes) {
+      const verification = verifyPageChange(captured.manifest, change);
+      if (!verification.supported) {
+        skippedCount += 1;
+        continue;
       }
-      if (located.parent?.id !== change.toParentId) {
+      verifiedCount += 1;
+      maxPositionErrorPx = Math.max(
+        maxPositionErrorPx,
+        verification.positionError || 0,
+      );
+      if (!verification.ok) {
         throw Object.assign(
-          new Error(`节点 ${change.nodeId} 的父级与 Figma 不一致。`),
-          { code: "verification_parent_mismatch" },
+          new Error(
+            `节点 ${verification.nodeId || change.nodeId} 的 ${change.property} 与 Figma 不一致。`,
+          ),
+          {
+            code: `verification_${verification.reason || "value_mismatch"}`,
+          },
         );
-      }
-      const actualIndex = located.parent.children.indexOf(located.node);
-      if (actualIndex !== change.toIndex) {
-        throw Object.assign(
-          new Error(`节点 ${change.nodeId} 的顺序与 Figma 不一致。`),
-          { code: "verification_order_mismatch" },
-        );
-      }
-      if (change.afterBounds) {
-        const error = Math.max(
-          Math.abs(located.node.x - change.afterBounds.x),
-          Math.abs(located.node.y - change.afterBounds.y),
-        );
-        maxPositionErrorPx = Math.max(maxPositionErrorPx, error);
-        if (error > 2) {
-          throw Object.assign(
-            new Error(`节点 ${change.nodeId} 的位置误差为 ${error.toFixed(2)}px。`),
-            { code: "verification_geometry_mismatch" },
-          );
-        }
       }
     }
     fastApply.verification = {
-      status: "passed",
+      status: verifiedCount > 0 ? "passed" : "not_required",
       preflight: report.status,
-      checkedNodes: structural.length,
+      checkedNodes: verifiedCount,
+      skippedChanges: skippedCount,
       maxPositionErrorPx,
     };
+    return captured.manifest;
   } catch (error) {
     let rollback = { status: "failed", reason: "rollback_not_attempted" };
     try {
-      const undo = await undoLastPatchTransaction(projectDir);
+      const undo = await undoPatchTransactionById(
+        projectDir,
+        fastApply.transactionId,
+      );
       rollback = {
         status: undo.status === "committed" ? "passed" : "failed",
         reason:
@@ -2154,6 +2650,7 @@ async function verifyFastApply(projectDir, current, result, fastApply) {
       message: error instanceof Error ? error.message : String(error),
       rollback,
     };
+    return null;
   }
 }
 
@@ -2296,6 +2793,9 @@ async function updateWorkspace(args) {
 }
 
 async function ensurePreview(projectDir, preferredUrl) {
+  if (workspaceClosing.has(projectDir) || activeProject !== projectDir) {
+    throw new Error("当前项目正在切换，已停止恢复旧的页面预览。");
+  }
   const running = previews.get(projectDir);
   if (running && (await isReachable(running.url))) {
     return running;
@@ -2313,6 +2813,10 @@ async function ensurePreview(projectDir, preferredUrl) {
   }
 
   const preview = await startProjectPreview(projectDir);
+  if (workspaceClosing.has(projectDir) || activeProject !== projectDir) {
+    await preview.stop().catch(() => {});
+    throw new Error("当前项目正在切换，已停止恢复旧的页面预览。");
+  }
   previews.set(projectDir, preview);
   return preview;
 }
@@ -2788,6 +3292,33 @@ function toolResult(state, text) {
   };
 }
 
+function projectCatalogResult(projectCatalog, text) {
+  const catalog = Array.isArray(projectCatalog)
+    ? projectCatalog.map((project) => ({ ...project }))
+    : [];
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: { projectCatalog: catalog },
+    _meta: { projectCatalog: catalog },
+  };
+}
+
+function locationSelectionResult(selection) {
+  const locationSelection = {
+    selected: Boolean(selection?.selected),
+    cancelled: Boolean(selection?.cancelled),
+    path: selection?.selected ? String(selection.path || "") : "",
+  };
+  const text = locationSelection.selected
+    ? "已选择本地项目位置。"
+    : "已取消选择，没有创建任何文件。";
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: { locationSelection },
+    _meta: { locationSelection },
+  };
+}
+
 function previewImageResult(state, previewImage) {
   const workspace = publicState(state);
   return {
@@ -2810,7 +3341,11 @@ function publicState(state) {
     launcherId: state.launcherId || "",
     workspaceDir: state.workspaceDir || "",
     projectDir: state.projectDir || "",
+    projectKey: state.projectKey || state.preflightReport?.projectKey || "",
     projectName: state.projectName || "CDB",
+    projectCatalog: Array.isArray(state.projectCatalog)
+      ? state.projectCatalog.map((project) => ({ ...project }))
+      : [],
     pages: Array.isArray(state.pages)
       ? state.pages.map((page) => ({ ...page }))
       : [],

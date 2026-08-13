@@ -290,11 +290,11 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
   }
 
   function parseGradient(layer) {
-    const match = layer.match(/^(linear-gradient|radial-gradient)\((.*)\)$/i);
+    const match = layer.match(/^(linear-gradient|radial-gradient|conic-gradient)\((.*)\)$/i);
     if (!match) return null;
     const type = match[1].toLowerCase();
     const parts = splitCssLayers(match[2]);
-    let angle = 180;
+    let angle = type === "conic-gradient" ? 0 : 180;
     let center = { x: 0.5, y: 0.5 };
     if (type === "linear-gradient") {
       const parsedAngle = gradientAngle(parts[0] || "");
@@ -302,7 +302,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
         angle = parsedAngle;
         parts.shift();
       }
-    } else {
+    } else if (type === "radial-gradient") {
       const descriptor = parts[0] || "";
       const centerMatch = descriptor.match(/\bat\s+(-?\d*\.?\d+)%\s+(-?\d*\.?\d+)%/i);
       if (centerMatch) {
@@ -314,12 +314,26 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       if (/\b(circle|ellipse|closest|farthest|at)\b/i.test(descriptor)) {
         parts.shift();
       }
+    } else {
+      const descriptor = parts[0] || "";
+      const angleMatch = descriptor.match(/\bfrom\s+(-?\d*\.?\d+)deg/i);
+      const centerMatch = descriptor.match(/\bat\s+(-?\d*\.?\d+)%\s+(-?\d*\.?\d+)%/i);
+      if (angleMatch) angle = Number.parseFloat(angleMatch[1]);
+      if (centerMatch) {
+        center = {
+          x: Math.max(0, Math.min(1, Number.parseFloat(centerMatch[1]) / 100)),
+          y: Math.max(0, Math.min(1, Number.parseFloat(centerMatch[2]) / 100)),
+        };
+      }
+      if (/\b(from|at)\b/i.test(descriptor)) parts.shift();
     }
     const stops = normalizeGradientStops(parts.flatMap(gradientStop));
     if (stops.length < 2) return null;
-    return type === "linear-gradient"
-      ? { type, angle: round(angle), stops }
-      : { type, center, stops };
+    if (type === "linear-gradient") return { type, angle: round(angle), stops };
+    if (type === "conic-gradient") {
+      return { type, angle: round(angle), center, stops };
+    }
+    return { type, center, stops };
   }
 
   function parseBoxShadows(value) {
@@ -539,25 +553,98 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     return content && content !== "none" && content !== "normal";
   }
 
-  function pseudoOffset(style, hostWidth, hostHeight, width, height) {
+  function establishesContainingBlock(style, position) {
+    const contain = String(style.contain || "").toLowerCase();
+    const willChange = String(style.willChange || "").toLowerCase();
+    if (position === "fixed") {
+      return (
+        (style.transform && style.transform !== "none") ||
+        (style.perspective && style.perspective !== "none") ||
+        (style.filter && style.filter !== "none") ||
+        /(?:paint|layout|strict|content)/.test(contain) ||
+        /(?:transform|perspective|filter)/.test(willChange)
+      );
+    }
+    return (
+      style.position !== "static" ||
+      (style.transform && style.transform !== "none") ||
+      (style.perspective && style.perspective !== "none") ||
+      (style.filter && style.filter !== "none") ||
+      /(?:paint|layout|strict|content)/.test(contain) ||
+      /(?:transform|perspective|filter)/.test(willChange)
+    );
+  }
+
+  function pseudoContainingBlock(element, position) {
+    let current = element;
+    while (current && current.nodeType === Node.ELEMENT_NODE) {
+      const currentStyle = getComputedStyle(current);
+      if (establishesContainingBlock(currentStyle, position)) return current;
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  function positionedBox(element, position, hostRect) {
+    const containingBlock = pseudoContainingBlock(element, position);
+    if (!containingBlock) {
+      return {
+        left: 0,
+        top: 0,
+        right: document.documentElement.clientWidth,
+        bottom: document.documentElement.clientHeight,
+      };
+    }
+    const rect = containingBlock.getBoundingClientRect();
+    const style = getComputedStyle(containingBlock);
+    return {
+      left: rect.left + cssPixels(style.borderLeftWidth),
+      top: rect.top + cssPixels(style.borderTopWidth),
+      right: rect.right - cssPixels(style.borderRightWidth),
+      bottom: rect.bottom - cssPixels(style.borderBottomWidth),
+    };
+  }
+
+  function pseudoOffset(element, style, hostRect, width, height) {
     const left = String(style.left || "auto");
     const right = String(style.right || "auto");
     const top = String(style.top || "auto");
     const bottom = String(style.bottom || "auto");
-    let x = left !== "auto"
-      ? cssPixels(left)
-      : right !== "auto"
-        ? hostWidth - cssPixels(right) - width
-        : 0;
-    let y = top !== "auto"
-      ? cssPixels(top)
-      : bottom !== "auto"
-        ? hostHeight - cssPixels(bottom) - height
-        : 0;
+    const positioned =
+      style.position === "absolute" || style.position === "fixed";
+    const box = positioned
+      ? positionedBox(element, style.position, hostRect)
+      : {
+          left: hostRect.left,
+          top: hostRect.top,
+          right: hostRect.right,
+          bottom: hostRect.bottom,
+        };
+    let x =
+      left !== "auto"
+        ? box.left + cssPixels(left) - hostRect.left
+        : right !== "auto"
+          ? box.right - cssPixels(right) - width - hostRect.left
+          : 0;
+    let y =
+      top !== "auto"
+        ? box.top + cssPixels(top) - hostRect.top
+        : bottom !== "auto"
+          ? box.bottom - cssPixels(bottom) - height - hostRect.top
+          : 0;
     let rotation = 0;
     if (style.transform && style.transform !== "none") {
       try {
         const matrix = new DOMMatrixReadOnly(style.transform);
+        // CSS transforms apply around transform-origin. Translation terms in
+        // the computed matrix are therefore not absolute child offsets.
+        const origin = String(style.transformOrigin || "0 0")
+          .split(/\s+/)
+          .map(cssPixels);
+        const originX = origin[0] || 0;
+        const originY = origin[1] || 0;
+        x += originX - (matrix.a * originX + matrix.c * originY);
+        y += originY - (matrix.b * originX + matrix.d * originY);
         x += matrix.e || 0;
         y += matrix.f || 0;
         rotation = round((Math.atan2(matrix.b, matrix.a) * 180) / Math.PI);
@@ -566,7 +653,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     return { x: round(x), y: round(y), rotation };
   }
 
-  function pseudoDefinition(element, pseudo, hostWidth, hostHeight) {
+  function pseudoDefinition(element, pseudo, hostRect) {
     if (nodeCount >= MAX_NODES) return null;
     const style = getComputedStyle(element, pseudo);
     if (!pseudoExists(style) || style.display === "none" || style.visibility === "hidden") {
@@ -576,7 +663,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     const size = triangle || cssBoxSize(style);
     if (size.width <= 0.5 || size.height <= 0.5) return null;
     const kind = pseudo === "::before" ? "before" : "after";
-    const offset = pseudoOffset(style, hostWidth, hostHeight, size.width, size.height);
+    const offset = pseudoOffset(element, style, hostRect, size.width, size.height);
     const common = {
       id: uniqueId(element, kind),
       name: (element.getAttribute("aria-label") || element.getAttribute("data-codex-id") || element.tagName.toLowerCase()) + " " + kind,
@@ -637,6 +724,165 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     return weight + italic;
   }
 
+  const GENERIC_FONT_FAMILIES = new Set([
+    "serif",
+    "sans-serif",
+    "monospace",
+    "cursive",
+    "fantasy",
+    "system-ui",
+    "ui-serif",
+    "ui-sans-serif",
+    "ui-monospace",
+    "ui-rounded",
+    "emoji",
+    "math",
+    "fangsong",
+  ]);
+  const fontProbeCanvas = document.createElement("canvas");
+  fontProbeCanvas.width = 320;
+  fontProbeCanvas.height = 96;
+  const fontProbeContext = fontProbeCanvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+  const fontProbeCache = new Map();
+
+  function uniqueFontFamilies(families) {
+    const seen = new Set();
+    return families.filter((family) => {
+      const key = String(family || "").trim().toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function symbolFontCandidates() {
+    const platform = String(navigator.userAgentData?.platform || navigator.platform || "");
+    const preferred = /win/i.test(platform)
+      ? ["Segoe UI Symbol", "Segoe UI", "Arial Unicode MS"]
+      : /mac/i.test(platform)
+        ? ["Apple Symbols", "SF Pro", "Arial Unicode MS"]
+        : ["Noto Sans Symbols 2", "Noto Sans Symbols", "DejaVu Sans"];
+    return uniqueFontFamilies([
+      ...preferred,
+      "Segoe UI Symbol",
+      "Apple Symbols",
+      "Noto Sans Symbols 2",
+      "Noto Sans Symbols",
+      "Arial Unicode MS",
+      "DejaVu Sans",
+    ]);
+  }
+
+  function isShortSymbolText(text) {
+    const value = String(text || "").trim();
+    return (
+      value.length > 0 &&
+      Array.from(value).length <= 4 &&
+      /\p{S}/u.test(value) &&
+      !/[\p{L}\p{N}\p{M}]/u.test(value)
+    );
+  }
+
+  function fontCandidates(text, style) {
+    const declared = String(style.fontFamily || "")
+      .split(",")
+      .map((family) => family.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean)
+      .slice(0, 8);
+    const concrete = declared.filter(
+      (family) => !GENERIC_FONT_FAMILIES.has(String(family).toLowerCase()),
+    );
+    const generic = declared.filter(
+      (family) => GENERIC_FONT_FAMILIES.has(String(family).toLowerCase()),
+    );
+    if (isShortSymbolText(text)) {
+      const explicitSymbol = concrete.filter(
+        (family) =>
+          /(?:icon|symbol|material|awesome|phosphor|lucide|bootstrap|remix)/i.test(
+            family,
+          ),
+      );
+      return uniqueFontFamilies([
+        ...explicitSymbol,
+        ...symbolFontCandidates(),
+        ...concrete,
+        ...declared,
+      ]).slice(0, 16);
+    }
+    return uniqueFontFamilies([...concrete, ...generic]).slice(0, 16);
+  }
+
+  function cssFontFamily(family) {
+    return GENERIC_FONT_FAMILIES.has(String(family).toLowerCase())
+      ? family
+      : JSON.stringify(family);
+  }
+
+  function fontProbeText(text) {
+    return Array.from(new Set(Array.from(String(text || "").replace(/\s/g, ""))))
+      .slice(0, 16)
+      .join("") || " ";
+  }
+
+  function renderedFontDiffers(family, text, fallback) {
+    if (!fontProbeContext) return true;
+    const probe = fontProbeText(text);
+    const key = family + "\u0000" + fallback + "\u0000" + probe;
+    if (fontProbeCache.has(key)) return fontProbeCache.get(key);
+    const render = (font) => {
+      fontProbeContext.clearRect(0, 0, fontProbeCanvas.width, fontProbeCanvas.height);
+      fontProbeContext.fillStyle = "#000";
+      fontProbeContext.textBaseline = "alphabetic";
+      fontProbeContext.font = "48px " + font;
+      fontProbeContext.fillText(probe, 4, 68);
+      return fontProbeContext.getImageData(
+        0,
+        0,
+        fontProbeCanvas.width,
+        fontProbeCanvas.height,
+      ).data;
+    };
+    const candidate = render(cssFontFamily(family) + ", " + fallback);
+    const baseline = render(fallback);
+    let differs = false;
+    for (let index = 3; index < candidate.length; index += 4) {
+      if (candidate[index] !== baseline[index]) {
+        differs = true;
+        break;
+      }
+    }
+    fontProbeCache.set(key, differs);
+    return differs;
+  }
+
+  function fontSupportsText(family, text, fontSize) {
+    try {
+      if (
+        document.fonts &&
+        !document.fonts.check(fontSize + "px " + cssFontFamily(family), text)
+      ) {
+        return false;
+      }
+    } catch {}
+    if (GENERIC_FONT_FAMILIES.has(String(family).toLowerCase())) return true;
+    return (
+      renderedFontDiffers(family, text, "monospace") ||
+      renderedFontDiffers(family, text, "serif")
+    );
+  }
+
+  function resolvedFontFamily(text, style) {
+    const candidates = fontCandidates(text, style);
+    if (isShortSymbolText(text)) return candidates[0] || "Segoe UI Symbol";
+    const fontSize = Number.parseFloat(style.fontSize) || 16;
+    for (const family of candidates) {
+      if (fontSupportsText(family, text, fontSize)) return family;
+    }
+    return candidates[0] || "Inter";
+  }
+
   function textDefinition({
     id,
     name,
@@ -670,6 +916,9 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
         : textAlign === "center"
           ? widthSafety / 2
           : 0;
+    const candidates = fontCandidates(text, style);
+    const family = resolvedFontFamily(text, style);
+    const symbolText = isShortSymbolText(text);
     return {
       id,
       type: "text",
@@ -684,8 +933,9 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       ...(layoutItem ? { layoutItem } : {}),
       text,
       font: {
-        family: style.fontFamily.split(",")[0].trim().replace(/^["']|["']$/g, "") || "Inter",
-        style: fontStyle(style),
+        family,
+        fallbacks: candidates.filter((candidate) => candidate !== family).slice(0, 8),
+        style: symbolText ? "Regular" : fontStyle(style),
         size: positive(fontSize),
         lineHeight: positive(
           Number.isFinite(parsedLineHeight) ? parsedLineHeight : fontSize * 1.2
@@ -942,6 +1192,22 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     }[value] || fallback;
   }
 
+  function hasAutoMainAxisMargin(element, horizontal) {
+    return Array.from(element.children).some((child) => {
+      if (!isVisible(child)) return false;
+      const childStyle = getComputedStyle(child);
+      const margins = horizontal
+        ? [childStyle.marginLeft, childStyle.marginRight]
+        : [childStyle.marginTop, childStyle.marginBottom];
+      // Computed styles resolve auto to the distributed pixel value. Any
+      // main-axis margin therefore needs coordinate preservation because
+      // Figma Auto Layout has no per-child margin primitive.
+      return margins.some(
+        (value) => value === "auto" || Math.abs(Number.parseFloat(value) || 0) > 0.01,
+      );
+    });
+  }
+
   function layoutDefinition(element, style) {
     const display = String(style.display || "").toLowerCase();
     const padding = {
@@ -957,6 +1223,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       return {
         kind: "flex",
         direction: horizontal ? "horizontal" : "vertical",
+        preservePositions: hasAutoMainAxisMargin(element, horizontal),
         wrap: style.flexWrap !== "nowrap",
         gap: pixelValue(primaryGap),
         counterGap: pixelValue(counterGap),
@@ -971,6 +1238,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       return {
         kind: "grid",
         direction: "none",
+        preservePositions: true,
         wrap: false,
         gap: pixelValue(style.columnGap),
         counterGap: pixelValue(style.rowGap),
@@ -1030,6 +1298,21 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
         ? String(style.gridColumn || "auto").slice(0, 80)
         : "auto",
     };
+  }
+
+  function requiresCoordinateLayout(element, style, layout) {
+    if (layout.preservePositions || layout.kind === "grid") return true;
+    if (style.position === "fixed" || style.position === "absolute") return true;
+    if (style.transform && style.transform !== "none") return true;
+    return Array.from(element.children).some((child) => {
+      if (!isVisible(child)) return false;
+      const childStyle = getComputedStyle(child);
+      return (
+        childStyle.position === "fixed" ||
+        childStyle.position === "absolute" ||
+        (childStyle.transform && childStyle.transform !== "none")
+      );
+    });
   }
 
   function buildNode(element, parentRect, isRoot = false) {
@@ -1153,23 +1436,33 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       );
       fallbackFill = bodyFill || htmlFill || "#FFFFFF";
     }
+    const layout = layoutDefinition(element, style);
+    // Browser geometry is the source of truth for the first Figma import.
+    // Keep the CSS layout metadata for round-tripping, but do not ask Figma
+    // Auto Layout to solve the page a second time with different font metrics
+    // and flex/grid semantics. Authors can explicitly opt a proven-safe frame
+    // back into native Auto Layout with data-codex-layout="auto".
+    layout.preservePositions =
+      element.getAttribute("data-codex-layout") !== "auto" ||
+      requiresCoordinateLayout(element, style, layout);
     const node = {
       id,
       type: "frame",
       name: element.getAttribute("aria-label") || id,
       sourceRef: ref,
       clipsContent:
+        isRoot ||
         ["hidden", "clip"].includes(style.overflowX) ||
         ["hidden", "clip"].includes(style.overflowY),
-      width: geometry.width,
-      height: geometry.height,
+      width: isRoot ? positive(window.innerWidth) : geometry.width,
+      height: isRoot ? positive(window.innerHeight) : geometry.height,
       x: isRoot ? 0 : round(rect.left - parentRect.left),
       y: isRoot ? 0 : round(rect.top - parentRect.top),
       opacity: Math.max(0, Math.min(1, Number.parseFloat(style.opacity) || 1)),
-      rotation: geometry.rotation,
+      rotation: isRoot ? 0 : geometry.rotation,
       style: boxStyle(style, fallbackFill),
       ...(layoutItem ? { layoutItem } : {}),
-      layout: layoutDefinition(element, style),
+      layout,
       children: [],
     };
 
@@ -1197,12 +1490,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       }
     }
 
-    const before = pseudoDefinition(
-      element,
-      "::before",
-      geometry.width,
-      geometry.height,
-    );
+    const before = pseudoDefinition(element, "::before", rect);
     if (before) node.children.push(before);
 
     const repeatedGrid = repeatedGridFallback(
@@ -1239,12 +1527,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       if (definition) node.children.push(definition);
     }
     node.children.push(...directTextChildren(element, rect, style));
-    const after = pseudoDefinition(
-      element,
-      "::after",
-      geometry.width,
-      geometry.height,
-    );
+    const after = pseudoDefinition(element, "::after", rect);
     if (after) node.children.push(after);
     return node;
   }

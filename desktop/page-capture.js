@@ -1,10 +1,24 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  CAPTURE_PAGE_SCRIPT as SHARED_CAPTURE_PAGE_SCRIPT,
+  capturePreviewPage as captureSharedPreviewPage,
+  createCapturedPageManifest as createSharedCapturedPageManifest,
+} from "../codex-plugin/codex-design-bridge/shared/page-capture.mjs";
 
 const CAPTURE_WIDTH = 1440;
 const CAPTURE_HEIGHT = 900;
+export const CAPTURE_PAGE_SCRIPT = SHARED_CAPTURE_PAGE_SCRIPT;
 
-export async function capturePreviewPage({
+export async function capturePreviewPage(options) {
+  return captureSharedPreviewPage(options);
+}
+
+export function createCapturedPageManifest(snapshot, options) {
+  return createSharedCapturedPageManifest(snapshot, options);
+}
+
+async function captureLegacyPreviewPage({
   createBrowserWindow,
   previewUrl,
   rootDirectory,
@@ -67,7 +81,7 @@ export async function capturePreviewPage({
   }
 }
 
-export function createCapturedPageManifest(
+function createLegacyCapturedPageManifest(
   snapshot,
   { projectName = "Frontend", previewUrl = "" } = {},
 ) {
@@ -111,7 +125,7 @@ function withCaptureRevision(url) {
   return value.toString();
 }
 
-export const CAPTURE_PAGE_SCRIPT = String.raw`
+const LEGACY_CAPTURE_PAGE_SCRIPT = String.raw`
 (async () => {
   const MAX_NODES = 480;
   const MAX_EXTERNAL_SVG_BYTES = 768 * 1024;
@@ -208,6 +222,74 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     return "#" + channel(match[1]) + channel(match[2]) + channel(match[3]) + alphaHex;
   }
 
+  function hasAutoMainAxisMargin(element, horizontal) {
+    return Array.from(element.children).some((child) => {
+      if (!isVisible(child)) return false;
+      const childStyle = getComputedStyle(child);
+      const margins = horizontal
+        ? [childStyle.marginLeft, childStyle.marginRight]
+        : [childStyle.marginTop, childStyle.marginBottom];
+      return margins.some(
+        (value) => value === "auto" || Math.abs(Number.parseFloat(value) || 0) > 0.01,
+      );
+    });
+  }
+
+  function layoutDefinition(element, style) {
+    const display = String(style.display || "").toLowerCase();
+    const padding = {
+      top: Math.max(0, round(Number.parseFloat(style.paddingTop) || 0)),
+      right: Math.max(0, round(Number.parseFloat(style.paddingRight) || 0)),
+      bottom: Math.max(0, round(Number.parseFloat(style.paddingBottom) || 0)),
+      left: Math.max(0, round(Number.parseFloat(style.paddingLeft) || 0)),
+    };
+    if (display === "flex" || display === "inline-flex") {
+      const horizontal = !String(style.flexDirection || "row").startsWith("column");
+      return {
+        direction: horizontal ? "horizontal" : "vertical",
+        preservePositions: hasAutoMainAxisMargin(element, horizontal),
+        gap: 0,
+        padding,
+        align: "start",
+        justify: "start",
+      };
+    }
+    if (display === "grid" || display === "inline-grid") {
+      return {
+        direction: "none",
+        preservePositions: true,
+        gap: 0,
+        padding,
+        align: "start",
+        justify: "start",
+      };
+    }
+    return {
+      direction: "none",
+      preservePositions: false,
+      gap: 0,
+      padding,
+      align: "start",
+      justify: "start",
+    };
+  }
+
+  function requiresCoordinateLayout(element, style, layout) {
+    if (layout.preservePositions || style.position === "fixed" || style.position === "absolute") {
+      return true;
+    }
+    if (style.transform && style.transform !== "none") return true;
+    return Array.from(element.children).some((child) => {
+      if (!isVisible(child)) return false;
+      const childStyle = getComputedStyle(child);
+      return (
+        childStyle.position === "fixed" ||
+        childStyle.position === "absolute" ||
+        (childStyle.transform && childStyle.transform !== "none")
+      );
+    });
+  }
+
   function splitCssLayers(value) {
     const layers = [];
     let start = 0;
@@ -289,11 +371,11 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
   }
 
   function parseGradient(layer) {
-    const match = layer.match(/^(linear-gradient|radial-gradient)\((.*)\)$/i);
+    const match = layer.match(/^(linear-gradient|radial-gradient|conic-gradient)\((.*)\)$/i);
     if (!match) return null;
     const type = match[1].toLowerCase();
     const parts = splitCssLayers(match[2]);
-    let angle = 180;
+    let angle = type === "conic-gradient" ? 0 : 180;
     let center = { x: 0.5, y: 0.5 };
     if (type === "linear-gradient") {
       const parsedAngle = gradientAngle(parts[0] || "");
@@ -301,7 +383,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
         angle = parsedAngle;
         parts.shift();
       }
-    } else {
+    } else if (type === "radial-gradient") {
       const descriptor = parts[0] || "";
       const centerMatch = descriptor.match(/\bat\s+(-?\d*\.?\d+)%\s+(-?\d*\.?\d+)%/i);
       if (centerMatch) {
@@ -313,12 +395,26 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       if (/\b(circle|ellipse|closest|farthest|at)\b/i.test(descriptor)) {
         parts.shift();
       }
+    } else {
+      const descriptor = parts[0] || "";
+      const angleMatch = descriptor.match(/\bfrom\s+(-?\d*\.?\d+)deg/i);
+      const centerMatch = descriptor.match(/\bat\s+(-?\d*\.?\d+)%\s+(-?\d*\.?\d+)%/i);
+      if (angleMatch) angle = Number.parseFloat(angleMatch[1]);
+      if (centerMatch) {
+        center = {
+          x: Math.max(0, Math.min(1, Number.parseFloat(centerMatch[1]) / 100)),
+          y: Math.max(0, Math.min(1, Number.parseFloat(centerMatch[2]) / 100)),
+        };
+      }
+      if (/\b(from|at)\b/i.test(descriptor)) parts.shift();
     }
     const stops = normalizeGradientStops(parts.flatMap(gradientStop));
     if (stops.length < 2) return null;
-    return type === "linear-gradient"
-      ? { type, angle: round(angle), stops }
-      : { type, center, stops };
+    if (type === "linear-gradient") return { type, angle: round(angle), stops };
+    if (type === "conic-gradient") {
+      return { type, angle: round(angle), center, stops };
+    }
+    return { type, center, stops };
   }
 
   function parseBoxShadows(value) {
@@ -433,6 +529,104 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     return weight + italic;
   }
 
+  function uniqueFontFamilies(families) {
+    const seen = new Set();
+    return families.filter((family) => {
+      const key = String(family || "").trim().toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function symbolFontCandidates() {
+    const platform = String(navigator.userAgentData?.platform || navigator.platform || "");
+    const preferred = /win/i.test(platform)
+      ? ["Segoe UI Symbol", "Segoe UI", "Arial Unicode MS"]
+      : /mac/i.test(platform)
+        ? ["Apple Symbols", "SF Pro", "Arial Unicode MS"]
+        : ["Noto Sans Symbols 2", "Noto Sans Symbols", "DejaVu Sans"];
+    return uniqueFontFamilies([
+      ...preferred,
+      "Segoe UI Symbol",
+      "Apple Symbols",
+      "Noto Sans Symbols 2",
+      "Noto Sans Symbols",
+      "Arial Unicode MS",
+      "DejaVu Sans",
+    ]);
+  }
+
+  function isShortSymbolText(text) {
+    const value = String(text || "").trim();
+    return (
+      value.length > 0 &&
+      Array.from(value).length <= 4 &&
+      /\p{S}/u.test(value) &&
+      !/[\p{L}\p{N}\p{M}]/u.test(value)
+    );
+  }
+
+  function fontCandidates(text, style) {
+    const declared = String(style.fontFamily || "")
+      .split(",")
+      .map((family) => family.trim().replace(/^["']|["']$/g, ""))
+      .filter(Boolean)
+      .slice(0, 8);
+    const generic = new Set([
+      "serif",
+      "sans-serif",
+      "monospace",
+      "cursive",
+      "fantasy",
+      "system-ui",
+      "ui-serif",
+      "ui-sans-serif",
+      "ui-monospace",
+      "ui-rounded",
+      "emoji",
+      "math",
+      "fangsong",
+    ]);
+    const concrete = declared.filter(
+      (family) => !generic.has(String(family).toLowerCase()),
+    );
+    const genericFamilies = declared.filter(
+      (family) => generic.has(String(family).toLowerCase()),
+    );
+    if (isShortSymbolText(text)) {
+      const explicitSymbol = concrete.filter(
+        (family) =>
+          /(?:icon|symbol|material|awesome|phosphor|lucide|bootstrap|remix)/i.test(
+            family,
+          ),
+      );
+      return uniqueFontFamilies([
+        ...explicitSymbol,
+        ...symbolFontCandidates(),
+        ...concrete,
+        ...declared,
+      ]).slice(0, 16);
+    }
+    return uniqueFontFamilies([...concrete, ...genericFamilies]).slice(0, 16);
+  }
+
+  function resolvedFontFamily(text, style) {
+    const candidates = fontCandidates(text, style);
+    if (isShortSymbolText(text)) return candidates[0] || "Segoe UI Symbol";
+    if (document.fonts && text) {
+      const fontSize = Number.parseFloat(style.fontSize) || 16;
+      for (const family of candidates) {
+        try {
+          if (document.fonts.check(fontSize + "px " + JSON.stringify(family), text)) {
+            return family;
+          }
+        } catch {}
+      }
+    }
+    return candidates[0] || "Inter";
+  }
+
   function textDefinition({
     id,
     name,
@@ -465,6 +659,9 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
         : textAlign === "center"
           ? widthSafety / 2
           : 0;
+    const candidates = fontCandidates(text, style);
+    const family = resolvedFontFamily(text, style);
+    const symbolText = isShortSymbolText(text);
     return {
       id,
       type: "text",
@@ -478,8 +675,9 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       style: { fill },
       text,
       font: {
-        family: style.fontFamily.split(",")[0].trim().replace(/^["']|["']$/g, "") || "Inter",
-        style: fontStyle(style),
+        family,
+        fallbacks: candidates.filter((candidate) => candidate !== family).slice(0, 8),
+        style: symbolText ? "Regular" : fontStyle(style),
         size: positive(fontSize),
         lineHeight: positive(
           Number.isFinite(parsedLineHeight) ? parsedLineHeight : fontSize * 1.2
@@ -759,25 +957,30 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       );
       fallbackFill = bodyFill || htmlFill || "#FFFFFF";
     }
+    const layout = layoutDefinition(element, style);
+    // Browser geometry is the source of truth for the first Figma import.
+    // Preserve CSS layout metadata, while preventing Figma Auto Layout from
+    // recomputing browser positions with different layout/font semantics.
+    layout.preservePositions =
+      element.getAttribute("data-codex-layout") !== "auto" ||
+      requiresCoordinateLayout(element, style, layout);
     const node = {
       id,
       type: "frame",
       name: element.getAttribute("aria-label") || id,
       sourceRef: ref,
-      width: geometry.width,
-      height: geometry.height,
+      clipsContent:
+        isRoot ||
+        ["hidden", "clip"].includes(style.overflowX) ||
+        ["hidden", "clip"].includes(style.overflowY),
+      width: isRoot ? positive(window.innerWidth) : geometry.width,
+      height: isRoot ? positive(window.innerHeight) : geometry.height,
       x: isRoot ? 0 : round(rect.left - parentRect.left),
       y: isRoot ? 0 : round(rect.top - parentRect.top),
       opacity: Math.max(0, Math.min(1, Number.parseFloat(style.opacity) || 1)),
-      rotation: geometry.rotation,
+      rotation: isRoot ? 0 : geometry.rotation,
       style: boxStyle(style, fallbackFill),
-      layout: {
-        direction: "none",
-        gap: 0,
-        padding: { top: 0, right: 0, bottom: 0, left: 0 },
-        align: "start",
-        justify: "start",
-      },
+      layout,
       children: [],
     };
 
