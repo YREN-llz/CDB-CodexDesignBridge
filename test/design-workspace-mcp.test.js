@@ -4,9 +4,10 @@ import { solidVisualReference } from "./helpers/visual-reference.js";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { WebSocket } from "../codex-plugin/codex-design-bridge/vendor/ws/wrapper.mjs";
 import { commitPatchTransaction } from "../codex-plugin/codex-design-bridge/mcp/patch-transaction.mjs";
 
@@ -309,7 +310,25 @@ test("opens the active localhost preview route through the browser helper", asyn
   );
   await writeFile(
     path.join(projectDir, "design.html"),
-    '<!doctype html><title>Design route</title><main data-codex-root data-codex-id="design-root"><h1 data-codex-id="design-title">Design</h1></main>',
+    `<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Design route</title>
+    <style>
+      body { margin: 0; --layout: desktop; }
+      @media (max-width: 600px) { body { --layout: mobile; } }
+      header { position: fixed; top: 0; width: 100%; background: white; }
+      main { padding-top: 60px; }
+      #contact { margin-top: 2000px; padding-bottom: 100px; }
+    </style>
+    <header>Navigation</header>
+    <main data-codex-root data-codex-id="design-root">
+      <h1 data-codex-id="design-title">Design</h1>
+      <button onclick="this.textContent='Clicked'">Click me</button>
+      <form onsubmit="event.preventDefault();document.querySelector('output').textContent=this.elements.name.value">
+        <input name="name" aria-label="Name"><button>Submit</button><output></output>
+      </form>
+      <a href="#contact">Contact</a>
+      <section id="contact">Contact details <a href="/">Home</a></section>
+    </main>`,
     "utf8",
   );
   await writeCdbManifest(projectDir, [
@@ -355,11 +374,46 @@ test("opens the active localhost preview route through the browser helper", asyn
   const openedUrl = new URL(await readFile(capturePath, "utf8"));
   assert.equal(openedUrl.hostname, "127.0.0.1");
   assert.equal(openedUrl.pathname, "/design.html");
-  assert.equal(openedUrl.searchParams.get("__cdb_viewport"), "1440x900");
+  assert.equal(openedUrl.searchParams.has("__cdb_viewport"), false);
   const browserPreviewHtml = await (await fetch(openedUrl)).text();
-  assert.match(browserPreviewHtml, /data-cdb-browser-preview/);
-  assert.match(browserPreviewHtml, /width: 1440px; height: 900px/);
+  assert.doesNotMatch(browserPreviewHtml, /data-cdb-browser-preview/);
+  const oldUrl = new URL(openedUrl);
+  oldUrl.searchParams.set("__cdb_viewport", "1440x900");
+  assert.equal(await (await fetch(oldUrl)).text(), browserPreviewHtml);
   assert.match(opened.structuredContent.workspace.message, /默认浏览器/);
+
+  await t.test("external HTML keeps native scrolling, responsive layout, forms and navigation", async (t) => {
+    const modules = process.env.CODEX_WORKSPACE_NODE_MODULES || process.env.CODEX_NODE_MODULES ||
+      path.join(os.homedir(), ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules");
+    const entry = path.join(modules, "playwright/index.mjs");
+    try { await stat(entry); } catch { return t.skip("Bundled Playwright is unavailable"); }
+    const { chromium } = await import(pathToFileURL(entry).href);
+    const browser = await chromium.launch({
+      executablePath: process.env.CDB_TEST_BROWSER || (process.platform === "darwin"
+        ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : undefined),
+      headless: true,
+      args: ["--no-sandbox"],
+    });
+    t.after(() => browser.close());
+    const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
+    await page.goto(openedUrl.toString());
+    assert.equal(await page.locator("main").evaluate((element) => element.parentElement.tagName), "BODY");
+    assert.equal(await page.locator("body").evaluate((element) => getComputedStyle(element).getPropertyValue("--layout").trim()), "desktop");
+    assert.equal(await page.locator("body").evaluate((element) => getComputedStyle(element).overflow), "visible");
+    await page.getByRole("button", { name: "Click me" }).click();
+    await page.getByRole("button", { name: "Clicked" }).waitFor();
+    await page.getByLabel("Name").fill("Ada");
+    await page.getByRole("button", { name: "Submit" }).click();
+    assert.equal(await page.locator("output").textContent(), "Ada");
+    await page.getByRole("link", { name: "Contact", exact: true }).click();
+    assert.ok(await page.evaluate(() => scrollY) > 1000);
+    assert.equal(await page.locator("header").evaluate((element) => element.getBoundingClientRect().top), 0);
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.equal(await page.locator("body").evaluate((element) => getComputedStyle(element).getPropertyValue("--layout").trim()), "mobile");
+    assert.ok(await page.locator("main").evaluate((element) => element.getBoundingClientRect().width) <= 390);
+    await page.getByRole("link", { name: "Home", exact: true }).click();
+    await page.getByRole("heading", { name: "Ready" }).waitFor();
+  });
 });
 
 test("opens an unbound launcher and creates a ready native design without questions", async (t) => {

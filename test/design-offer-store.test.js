@@ -213,7 +213,7 @@ function sampleVisualReference() {
   };
 }
 
-function runtimeIdentity(exactBuild = "0.9.0+codex.20261125202836") {
+function runtimeIdentity(exactBuild = "0.9.0+codex.20261125204135") {
   return {
     kind: "cdb-0.9-responsive-v2",
     protocolVersion: 16,

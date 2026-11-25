@@ -173,7 +173,7 @@ test("plugin UI auto-connects and reports a fast update without settings UI", as
       protocolVersion: 16,
       runtimeIdentity: {
         kind: "cdb-0.9-responsive-v2",
-        exactBuild: "0.9.0+codex.20261125202836",
+        exactBuild: "0.9.0+codex.20261125204135",
         protocolVersion: 16,
         pageIrSchemaVersion: 2,
       },

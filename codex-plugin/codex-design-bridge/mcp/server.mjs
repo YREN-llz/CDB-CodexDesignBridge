@@ -2309,10 +2309,7 @@ async function openDesignPreviewInBrowser({ projectDir, pageId }) {
   if (!normalizeLocalUrl(url)) {
     throw new Error("只能打开当前项目的本地预览页面。");
   }
-  const browserUrl = preview.kind === "static"
-    ? browserPreviewUrl(url, page.viewport)
-    : url;
-  await openLocalUrlInDefaultBrowser(browserUrl);
+  await openLocalUrlInDefaultBrowser(url);
   const state = {
     ...current,
     previewUrl: preview.url,
@@ -4127,17 +4124,8 @@ async function serveStatic(root, request, response) {
     target = path.join(root, "index.html");
   }
   try {
-    let body = await readFile(target);
+    const body = await readFile(target);
     const type = contentType(target);
-    const browserViewport = parseBrowserPreviewViewport(
-      url.searchParams.get("__cdb_viewport"),
-    );
-    if (type.startsWith("text/html") && browserViewport) {
-      body = Buffer.from(
-        injectBrowserPreviewCanvas(body.toString("utf8"), browserViewport),
-        "utf8",
-      );
-    }
     response.writeHead(200, {
       "content-type": type,
       "cache-control": "no-store",
@@ -4284,71 +4272,6 @@ function previewUrlForPage(basePreviewUrl, pagePath) {
     throw new Error("页面路径必须属于当前本地预览。");
   }
   return target.toString();
-}
-
-function browserPreviewUrl(pageUrl, viewport) {
-  const width = boundedViewportDimension(viewport?.width);
-  const height = boundedViewportDimension(viewport?.height);
-  if (!width || !height) return pageUrl;
-  const target = new URL(pageUrl);
-  target.searchParams.set("__cdb_viewport", `${width}x${height}`);
-  return target.toString();
-}
-
-function parseBrowserPreviewViewport(value) {
-  const match = /^(\d{1,4})x(\d{1,4})$/u.exec(String(value || ""));
-  if (!match) return null;
-  const width = boundedViewportDimension(match[1]);
-  const height = boundedViewportDimension(match[2]);
-  return width && height ? { width, height } : null;
-}
-
-function boundedViewportDimension(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  const rounded = Math.round(number);
-  return rounded >= 1 && rounded <= 8_192 ? rounded : 0;
-}
-
-function injectBrowserPreviewCanvas(html, { width, height }) {
-  const marker = "data-cdb-browser-preview";
-  if (html.includes(marker)) return html;
-  const injection = [
-    `<style ${marker}>`,
-    "html[data-cdb-fit-preview], html[data-cdb-fit-preview] body { width: 100%; height: 100%; min-width: 0; min-height: 0; margin: 0; overflow: hidden; }",
-    "#cdb-browser-preview-stage { position: fixed; inset: 0; z-index: 2147483647; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #111116; }",
-    `#cdb-browser-preview-canvas { flex: 0 0 auto; width: ${width}px; height: ${height}px; transform-origin: center center; }`,
-    "</style>",
-    `<script ${marker}>`,
-    "(() => {",
-    "  const root = document.querySelector('[data-codex-root]');",
-    "  if (!root || root.closest('#cdb-browser-preview-canvas')) return;",
-    "  document.documentElement.setAttribute('data-cdb-fit-preview', '');",
-    "  const stage = document.createElement('div');",
-    "  stage.id = 'cdb-browser-preview-stage';",
-    "  const canvas = document.createElement('div');",
-    "  canvas.id = 'cdb-browser-preview-canvas';",
-    "  root.before(stage);",
-    "  stage.append(canvas);",
-    "  canvas.append(root);",
-    `  const width = ${width};`,
-    `  const height = ${height};`,
-    "  const fit = () => {",
-    "    const contentHeight = Math.max(height, root.offsetHeight, root.scrollHeight);",
-    "    canvas.style.height = `${contentHeight}px`;",
-    "    const scale = Math.min(1, Math.max(1, innerWidth - 32) / width, Math.max(1, innerHeight - 32) / contentHeight);",
-    "    canvas.style.transform = `scale(${scale})`;",
-    "    canvas.dataset.scale = String(scale);",
-    "  };",
-    "  addEventListener('resize', fit, { passive: true });",
-    "  new ResizeObserver(fit).observe(root);",
-    "  fit();",
-    "})();",
-    "</script>",
-  ].join("\n");
-  return /<\/body\s*>/iu.test(html)
-    ? html.replace(/<\/body\s*>/iu, `${injection}\n</body>`)
-    : `${html}\n${injection}\n`;
 }
 
 function normalizeLocalUrl(value) {
