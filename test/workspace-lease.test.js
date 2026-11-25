@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, utimes } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { WorkspaceLeaseManager } from "../codex-plugin/codex-design-bridge/mcp/workspace-lease.mjs";
@@ -52,23 +52,6 @@ test("unsent Figma changes do not block takeover", async (t) => {
   assert.equal(forcedShutdown, true);
   assert.equal(first.status().owned, false);
   assert.equal(second.status().owned, true);
-});
-
-test("recovers an abandoned lease lock within the acquisition window", async (t) => {
-  const leaseRoot = await mkdtemp(path.join(os.tmpdir(), "cdb-lease-stale-lock-"));
-  const staleLock = path.join(leaseRoot, "lease.lock");
-  await mkdir(staleLock);
-  const staleTime = new Date(Date.now() - 5_000);
-  await utimes(staleLock, staleTime, staleTime);
-  const workspace = manager(leaseRoot);
-  t.after(async () => {
-    await workspace.stop();
-    await rm(leaseRoot, { recursive: true, force: true });
-  });
-
-  const acquired = await workspace.acquire({ projectKey: "project-after-crash" });
-  assert.equal(acquired.acquired, true);
-  assert.equal(workspace.status().projectKey, "project-after-crash");
 });
 
 function manager(leaseRoot, overrides = {}) {

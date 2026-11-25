@@ -4,15 +4,12 @@ node_modules/
 # CDB local runtime state
 .figma-sync/
 .codex/
+.cdb/
 .cdb-imports/
-.cdb-runtime-backup/
 **/.figma-sync/
+**/.cdb/
 **/.codex/design-bridge.json
 **/.codex/design-bridge-token
-
-# Local design workspaces and agent scratch data
-team-workbench-web/
-.workbuddy/
 
 # Local secrets and environment overrides
 .env
@@ -37,5 +34,7 @@ Thumbs.db
 .vscode/
 
 # Local release artifacts
+figma-design/
+pnpm-lock.yaml
 releases/*.zip
 releases/*.sha256

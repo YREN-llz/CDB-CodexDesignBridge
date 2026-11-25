@@ -11,13 +11,11 @@ Use one deterministic entry point. Do not scan or create anything unless the use
 
 When the user sends only `@CDB`, calls CDB without another instruction, or asks to open CDB itself:
 
-1. Check only whether the current writable workspace contains `.cdb/manifest.json`.
-2. If it does, call `open_design_workspace` with that workspace and resume its active page.
-3. Otherwise call `open_design_launcher` and pass the writable workspace as `workspaceDir`.
-4. Do not recursively scan project files, create a draft, or open an external browser.
+1. Call `open_cdb` once with `action: "auto"` and the current writable workspace as `workspaceDir`.
+2. The tool resumes that workspace only when it contains `.cdb/manifest.json`; otherwise it opens the launcher.
+3. Do not inspect the filesystem yourself, recursively scan project files, create a draft, or open an external browser.
 
 The launcher focuses on starting from Figma or a new-design description. Local HTML upload remains an internal capability but is hidden from the normal interface.
-The launcher also shows the persistent CDB project list. This list contains only projects the user explicitly created or opened; never populate it by recursively scanning local disks or workspaces.
 
 ## Open a project
 
@@ -29,19 +27,17 @@ When the user says `@CDB 打开项目` or otherwise explicitly asks to open an e
 4. If preflight reports safe fixes, let the embedded workspace show and apply them. Do not bypass blockers.
 
 Only inspect `.cdb/manifest.json`, root HTML entries, or a user-selected directory. Do not recursively search unrelated workspace folders.
-The embedded project switcher may call `list_design_projects`, `open_registered_design_project`, and `forget_design_project`. Opening a registered project must still rerun unified preflight. Forgetting a project removes only the registry entry and must never delete or modify project files.
 
 ## Create a new design
 
 When the user says `@CDB 新建设计：<描述>` or gives an equivalent description:
 
-1. Call `create_design_project` immediately with the current writable workspace and the full description.
+1. Call `create_design_project` immediately with the current writable workspace and the full description. If the user specifies both artboard dimensions, pass them as `viewport.width` and `viewport.height` in CSS pixels.
 2. Do not ask about framework, package manager, port, page count, or project name.
 3. The tool creates `index.html`, `styles.css`, `assets/`, `AGENTS.md`, and `.cdb/manifest.json`, runs preflight, and opens the workspace.
 4. If no writable workspace exists, ask only for a save location.
 
 When the user asks to create a design but gives no description, call `open_design_launcher`; its new-design form continues through the current task.
-The launcher's create actions must open the native local folder picker first. Cancelling the picker creates nothing; after selection, the existing transactional project creator runs in the chosen parent directory.
 
 ## Start from Figma
 

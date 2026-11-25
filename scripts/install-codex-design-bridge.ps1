@@ -15,12 +15,19 @@ $ErrorActionPreference = "Stop"
 $pluginName = "codex-design-bridge"
 $pluginSelector = "$pluginName@$Marketplace"
 $profileDirectory = [Environment]::GetFolderPath("UserProfile")
-if (-not $profileDirectory) {
-  $profileDirectory = $env:USERPROFILE
+$localAppDataDirectory = [Environment]::GetFolderPath("LocalApplicationData")
+if (-not $localAppDataDirectory) {
+  $localAppDataDirectory = Join-Path $profileDirectory "AppData\Local"
 }
-if (-not $profileDirectory) {
-  throw "The user profile directory could not be resolved."
-}
+$dedicatedMarketplaceRootOverride = $env:CODEX_DESIGN_BRIDGE_LOCAL_MARKETPLACE_ROOT
+$marketplaceExplicit = $PSBoundParameters.ContainsKey("Marketplace")
+$destinationRootExplicit = $PSBoundParameters.ContainsKey("DestinationRoot") -and [bool]$DestinationRoot
+$reportPathExplicit = $PSBoundParameters.ContainsKey("ReportPath") -and [bool]$ReportPath
+$bootstrapMarketplace = $false
+$marketplaceAdded = $false
+$needsMarketplaceAdd = $false
+$localMarketplaceRoot = ""
+$mcpNodePath = ""
 $scriptDirectory = Split-Path -Parent $PSCommandPath
 $packageRoot = Split-Path -Parent $scriptDirectory
 $coreFiles = @(
@@ -28,19 +35,25 @@ $coreFiles = @(
   ".mcp.json",
   "assets\icon.png",
   "mcp\browser-capture.mjs",
-  "mcp\local-directory-picker.mjs",
-  "mcp\project-registry.mjs",
   "mcp\workspace.html",
+  "mcp\gateway.mjs",
+  "mcp\daemon.mjs",
   "mcp\server.mjs",
-  "mcp\page-change-compare.mjs",
   "mcp\fast-page-patch.mjs",
   "mcp\local-figma-bridge.mjs",
+  "mcp\local-workspace-server.mjs",
+  "mcp\design-offer-store.mjs",
+  "mcp\sync-baseline-store.mjs",
   "mcp\patch-transaction.mjs",
   "mcp\project-contract.mjs",
   "mcp\preview-process-guard.cjs",
   "mcp\workspace-lease.mjs",
   "shared\page-capture.mjs",
-  "shared\change-set-v14.schema.json",
+  "shared\change-set-v16.schema.json",
+  "shared\design-offer-v16.schema.json",
+  "shared\page-ir-responsive-v2.mjs",
+  "shared\page-ir-responsive-v2.schema.json",
+  "shared\runtime-contract.mjs",
   "shared\page.mjs",
   "shared\svg.mjs",
   "skills\start-design\SKILL.md",
@@ -161,6 +174,42 @@ function Resolve-CodexCommandPath {
   throw "Codex CLI was not found. Reinstall or update Codex, then run this installer again."
 }
 
+function Resolve-NodeCommandPath {
+  $candidates = @(
+    (Join-Path $profileDirectory ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\node.exe"),
+    (Join-Path $profileDirectory ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"),
+    (Join-Path $localAppDataDirectory "Programs\ChatGPT\resources\cua_node\node.exe"),
+    (Join-Path $localAppDataDirectory "Programs\Codex\resources\cua_node\node.exe"),
+    (Join-Path $localAppDataDirectory "OpenAI\ChatGPT\resources\cua_node\node.exe")
+  )
+  foreach ($candidate in $candidates) {
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+      return (Resolve-Path -LiteralPath $candidate).Path
+    }
+  }
+  foreach ($candidate in @("node.exe", "node")) {
+    $command = Get-Command $candidate -ErrorAction SilentlyContinue |
+      Select-Object -First 1
+    if ($command) {
+      return $command.Source
+    }
+  }
+  throw "A Node.js runtime was not found. Reinstall or update Codex, then run this installer again."
+}
+
+function Set-McpRuntime {
+  param([string]$PluginPath)
+
+  $script:mcpNodePath = Resolve-NodeCommandPath
+  $configPath = Join-Path $PluginPath ".mcp.json"
+  $config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
+  if (-not $config.mcpServers -or -not $config.mcpServers.design_workspace) {
+    throw "design_workspace MCP configuration was not found."
+  }
+  $config.mcpServers.design_workspace.command = $script:mcpNodePath
+  $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
+}
+
 function Invoke-CodexJson {
   param([string[]]$Arguments)
 
@@ -180,6 +229,47 @@ function Get-InstalledPlugin {
   return @($listing.installed) |
     Where-Object { $_.pluginId -eq $pluginSelector } |
     Select-Object -First 1
+}
+
+function Get-MarketplaceRoot {
+  $listing = Invoke-CodexJson -Arguments @("plugin", "marketplace", "list", "--json")
+  $entry = @($listing.marketplaces) |
+    Where-Object { $_.name -eq $Marketplace } |
+    Select-Object -First 1
+  if ($entry) {
+    return [string]$entry.root
+  }
+  return ""
+}
+
+function Test-MarketplaceContainsPlugin {
+  param([string]$MarketplacePath)
+
+  if (-not (Test-Path -LiteralPath $MarketplacePath -PathType Leaf)) {
+    return $false
+  }
+  $config = Get-Content -LiteralPath $MarketplacePath -Raw -Encoding utf8 | ConvertFrom-Json
+  return [bool](@($config.plugins) | Where-Object { $_.name -eq $pluginName } | Select-Object -First 1)
+}
+
+function Write-LocalMarketplace {
+  param([string]$MarketplacePath)
+
+  $directory = Split-Path -Parent $MarketplacePath
+  New-Item -ItemType Directory -Path $directory -Force | Out-Null
+  $payload = [ordered]@{
+    name = $Marketplace
+    interface = [ordered]@{ displayName = "Codex Design Bridge Local" }
+    plugins = @(
+      [ordered]@{
+        name = $pluginName
+        source = [ordered]@{ source = "local"; path = "./plugins/$pluginName" }
+        policy = [ordered]@{ installation = "AVAILABLE"; authentication = "ON_INSTALL" }
+        category = "Productivity"
+      }
+    )
+  }
+  $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $MarketplacePath -Encoding utf8
 }
 
 function Assert-SafeManagedPath {
@@ -299,15 +389,32 @@ $CodexCommand = Resolve-CodexCommandPath -RequestedCommand $CodexCommand
 Write-Host "Using Codex CLI: $CodexCommand"
 
 $marketplacePath = Join-Path $profileDirectory ".agents\plugins\marketplace.json"
-if (-not (Test-Path -LiteralPath $marketplacePath -PathType Leaf)) {
-  throw "Personal plugin marketplace was not found: $marketplacePath"
-}
-$marketplaceConfig = Get-Content -LiteralPath $marketplacePath -Raw -Encoding utf8 | ConvertFrom-Json
-$marketplaceEntry = @($marketplaceConfig.plugins) |
-  Where-Object { $_.name -eq $pluginName } |
-  Select-Object -First 1
-if (-not $marketplaceEntry) {
-  throw "Personal marketplace does not contain $pluginName. Configure the marketplace entry first."
+if ($Marketplace -eq "personal" -and -not (Test-MarketplaceContainsPlugin -MarketplacePath $marketplacePath)) {
+  if ($marketplaceExplicit -or $destinationRootExplicit) {
+    throw "Personal marketplace does not contain $pluginName. Remove the explicit marketplace/destination options to let the installer create its dedicated local marketplace."
+  }
+  $Marketplace = "codex-design-bridge-local"
+  $pluginSelector = "$pluginName@$Marketplace"
+  $localMarketplaceRoot = if ($dedicatedMarketplaceRootOverride) {
+    [IO.Path]::GetFullPath($dedicatedMarketplaceRootOverride)
+  } else {
+    Join-Path $localAppDataDirectory "Codex Design Bridge"
+  }
+  $DestinationRoot = [IO.Path]::GetFullPath((Join-Path $localMarketplaceRoot "plugins"))
+  if (-not $reportPathExplicit) {
+    $ReportPath = [IO.Path]::GetFullPath((Join-Path $DestinationRoot ".codex-design-bridge-install-report.json"))
+  }
+  $bootstrapMarketplace = $true
+  $configuredMarketplaceRoot = Get-MarketplaceRoot
+  if ($configuredMarketplaceRoot) {
+    $configuredMarketplaceRoot = [IO.Path]::GetFullPath($configuredMarketplaceRoot).TrimEnd("\")
+    $expectedMarketplaceRoot = [IO.Path]::GetFullPath($localMarketplaceRoot).TrimEnd("\")
+    if ($configuredMarketplaceRoot -ne $expectedMarketplaceRoot) {
+      throw "Marketplace $Marketplace is already configured from a different location: $configuredMarketplaceRoot"
+    }
+  } else {
+    $needsMarketplaceAdd = $true
+  }
 }
 
 New-Item -ItemType Directory -Path $DestinationRoot -Force | Out-Null
@@ -331,6 +438,8 @@ try {
     throw "Staged version does not match the release package."
   }
   Assert-HashesMatch -Expected $sourceHashes -Actual (Get-CoreHashes -PluginPath $stagingPath) -Label "Staging"
+  Set-McpRuntime -PluginPath $stagingPath
+  $sourceHashes = Get-CoreHashes -PluginPath $stagingPath
 
   $installedBefore = Get-InstalledPlugin
   if ($installedBefore) {
@@ -348,6 +457,14 @@ try {
   Move-Item -LiteralPath $stagingPath -Destination $targetPath
   $newTargetPlaced = $true
   Assert-HashesMatch -Expected $sourceHashes -Actual (Get-CoreHashes -PluginPath $targetPath) -Label "Personal plugin source"
+
+  if ($bootstrapMarketplace) {
+    Write-LocalMarketplace -MarketplacePath (Join-Path $localMarketplaceRoot ".agents\plugins\marketplace.json")
+    if ($needsMarketplaceAdd) {
+      Invoke-CodexJson -Arguments @("plugin", "marketplace", "add", $localMarketplaceRoot, "--json") | Out-Null
+      $marketplaceAdded = $true
+    }
+  }
 
   Invoke-CodexJson -Arguments @("plugin", "add", $pluginSelector, "--json") | Out-Null
   $installedAfter = Get-InstalledPlugin
@@ -382,6 +499,7 @@ try {
     pluginListConfirmed = $true
     backupPath = $backupPath
     previousVersion = if ($installedBefore) { $installedBefore.version } else { "" }
+    mcpNodePath = $mcpNodePath
     hashes = $sourceHashes
   }
 
@@ -405,6 +523,9 @@ try {
     }
     if ($installedBefore -and (Test-Path -LiteralPath $targetPath)) {
       Invoke-CodexJson -Arguments @("plugin", "add", $pluginSelector, "--json") | Out-Null
+    }
+    if ($marketplaceAdded) {
+      Invoke-CodexJson -Arguments @("plugin", "marketplace", "remove", $Marketplace, "--json") | Out-Null
     }
   } catch {
     Write-Warning "Automatic recovery also failed: $($_.Exception.Message)"

@@ -1,4 +1,5 @@
 import { computeHash, prepareSvgAsset } from "./svg.mjs";
+import { createResponsivePageIrFromNodeTree } from "./page-ir-responsive-v2.mjs";
 
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const MAX_NODES = 500;
@@ -70,7 +71,9 @@ export function preparePageManifest({ json, sourcePath }) {
       visible: typeof node.visible === "boolean" ? node.visible : true,
       opacity: boundedNumber(node.opacity, 1, 0, 1, `${path}.opacity`),
       style: normalizeStyle(node.style, `${path}.style`),
+      responsive: normalizeResponsive(node, `${path}.responsive`),
     };
+    normalized.constraints = normalized.responsive.constraints;
     if (node.layoutItem !== undefined) {
       normalized.layoutItem = normalizeLayoutItem(
         node.layoutItem,
@@ -124,17 +127,40 @@ export function preparePageManifest({ json, sourcePath }) {
   };
 
   const root = normalizeNode(value.root, "root");
-  return {
+  if (!value.responsiveContract || typeof value.responsiveContract !== "object" || Array.isArray(value.responsiveContract)) {
+    throw new PageValidationError("responsiveContract is required for protocol 16 Page IR Responsive v2.");
+  }
+  const prepared = {
     protocolVersion: 3,
     pageId,
+    projectKey: optionalString(value.projectKey, "", "projectKey", 256),
     name: optionalString(value.name, pageId, "name", 120),
     sourcePath,
     sourceHash: computeHash(json),
     source: normalizeSourceRef(value.source, "source"),
     root,
+    responsiveContract: structuredClone(value.responsiveContract),
     nodeIds: Array.from(ids),
     preparedAt: new Date().toISOString(),
   };
+  Object.defineProperty(prepared, "pageIr", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: createResponsivePageIrFromNodeTree({
+      pageId: prepared.pageId,
+      projectKey: prepared.projectKey,
+      name: prepared.name,
+      root: prepared.root,
+      origin: {
+        kind: "html",
+        sourceFile: prepared.source?.file || prepared.sourcePath || "",
+        sourceSelector: prepared.source?.selector || "",
+      },
+      responsiveContract: prepared.responsiveContract,
+    }),
+  });
+  return prepared;
 }
 
 function normalizeImage(image, path) {
@@ -220,7 +246,7 @@ function normalizeGradientFills(fills, path) {
     }
     const type = optionalEnum(
       fill.type,
-      ["linear-gradient", "radial-gradient", "conic-gradient"],
+      ["linear-gradient", "radial-gradient"],
       "linear-gradient",
       `${fillPath}.type`,
     );
@@ -252,9 +278,6 @@ function normalizeGradientFills(fills, path) {
               x: boundedNumber(fill.center?.x, 0.5, 0, 1, `${fillPath}.center.x`),
               y: boundedNumber(fill.center?.y, 0.5, 0, 1, `${fillPath}.center.y`),
             },
-            ...(type === "conic-gradient"
-              ? { angle: finiteNumber(fill.angle, 0, `${fillPath}.angle`) }
-              : {}),
           }),
     };
   });
@@ -305,7 +328,6 @@ function normalizeLayout(layout, path) {
       wrap: false,
       primarySizing: "fixed",
       counterSizing: "fixed",
-      preservePositions: false,
     };
   }
   if (!layout || typeof layout !== "object" || Array.isArray(layout)) {
@@ -355,10 +377,6 @@ function normalizeLayout(layout, path) {
       "fixed",
       `${path}.counterSizing`,
     ),
-    preservePositions:
-      typeof layout.preservePositions === "boolean"
-        ? layout.preservePositions
-        : false,
     ...(layout.kind === "grid"
       ? {
           grid: {
@@ -441,6 +459,48 @@ function normalizeLayoutItem(layoutItem, path) {
   };
 }
 
+function normalizeResponsive(node, path) {
+  const source = node?.responsive && typeof node.responsive === "object" && !Array.isArray(node.responsive)
+    ? node.responsive
+    : node || {};
+  const constraints = source.constraints;
+  let normalizedConstraints = null;
+  if (constraints !== undefined && constraints !== null) {
+    if (!constraints || typeof constraints !== "object" || Array.isArray(constraints)) {
+      throw new PageValidationError(`${path}.constraints must be an object or null.`);
+    }
+    normalizedConstraints = {
+      horizontal: optionalEnum(
+        String(constraints.horizontal || "MIN").toUpperCase(),
+        ["MIN", "CENTER", "MAX", "STRETCH", "SCALE"],
+        "MIN",
+        `${path}.constraints.horizontal`,
+      ),
+      vertical: optionalEnum(
+        String(constraints.vertical || "MIN").toUpperCase(),
+        ["MIN", "CENTER", "MAX", "STRETCH", "SCALE"],
+        "MIN",
+        `${path}.constraints.vertical`,
+      ),
+    };
+  }
+  return {
+    constraints: normalizedConstraints,
+    objectFit: optionalEnum(
+      source.objectFit,
+      ["fill", "contain", "cover", "none", "scale-down"],
+      "cover",
+      `${path}.objectFit`,
+    ),
+    minWidth: source.minWidth == null
+      ? null
+      : nonNegativeNumber(source.minWidth, `${path}.minWidth`),
+    maxWidth: source.maxWidth == null
+      ? null
+      : nonNegativeNumber(source.maxWidth, `${path}.maxWidth`),
+  };
+}
+
 function normalizePadding(value, path) {
   if (typeof value === "number") {
     const padding = nonNegativeNumber(value, path);
@@ -464,7 +524,6 @@ function normalizeFont(font, path) {
   if (font === undefined) {
     return {
       family: "Inter",
-      fallbacks: [],
       style: "Regular",
       size: 16,
       lineHeight: 24,
@@ -476,7 +535,6 @@ function normalizeFont(font, path) {
   }
   return {
     family: optionalString(font.family, "Inter", `${path}.family`, 120),
-    fallbacks: normalizeFontFallbacks(font.fallbacks, `${path}.fallbacks`),
     style: optionalString(font.style, "Regular", `${path}.style`, 120),
     size: positiveNumber(font.size ?? 16, `${path}.size`),
     lineHeight: positiveNumber(
@@ -488,17 +546,22 @@ function normalizeFont(font, path) {
       0,
       `${path}.letterSpacing`,
     ),
+    lineHeightUnit: textUnit(font.lineHeightUnit),
+    lineHeightValue: optionalFiniteNumber(font.lineHeightValue),
+    letterSpacingUnit: textUnit(font.letterSpacingUnit),
+    letterSpacingValue: optionalFiniteNumber(font.letterSpacingValue),
   };
 }
 
-function normalizeFontFallbacks(value, path) {
-  if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 8) {
-    throw new PageValidationError(`${path} must be an array of at most 8 font families.`);
-  }
-  return value.map((family, index) =>
-    optionalString(family, "", `${path}[${index}]`, 120),
-  ).filter(Boolean);
+function textUnit(value) {
+  const unit = String(value || "").toUpperCase();
+  return ["AUTO", "PIXELS", "PERCENT"].includes(unit) ? unit : "";
+}
+
+function optionalFiniteNumber(value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function normalizeSourceRef(value, path) {

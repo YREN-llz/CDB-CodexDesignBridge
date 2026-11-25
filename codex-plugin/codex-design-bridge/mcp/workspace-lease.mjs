@@ -1,21 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import {
-  mkdir,
-  readFile,
-  rename,
-  rm,
-  rmdir,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_HEARTBEAT_MS = 2_000;
 const DEFAULT_TTL_MS = 8_000;
 const HANDOFF_TIMEOUT_MS = 5_000;
-const LOCK_ACQUIRE_TIMEOUT_MS = 4_000;
-const LOCK_STALE_MS = 1_000;
 
 export class WorkspaceLeaseManager {
   constructor({
@@ -80,7 +70,7 @@ export class WorkspaceLeaseManager {
           this.leaseRoot,
         );
         await this.waitForRelease(current.leaseId);
-      } else if (!isExpired(current)) {
+      } else if (!isExpired(current) && isOwnerProcessAlive(current)) {
         return {
           acquired: false,
           confirmationRequired: false,
@@ -92,7 +82,12 @@ export class WorkspaceLeaseManager {
 
     const acquired = await this.withLock(async () => {
       const latest = await this.readLease();
-      if (latest && latest.leaseId !== current?.leaseId && !isExpired(latest)) {
+      if (
+        latest &&
+        latest.leaseId !== current?.leaseId &&
+        !isExpired(latest) &&
+        isOwnerProcessAlive(latest)
+      ) {
         return false;
       }
       this.projectKey = projectKey;
@@ -102,6 +97,7 @@ export class WorkspaceLeaseManager {
     if (!acquired) {
       return { acquired: false, confirmationRequired: false, reason: "lease_race" };
     }
+    await removeLeaseSecret(current, this.leaseRoot);
     this.startHeartbeat();
     return { acquired: true, lease: await this.readLease() };
   }
@@ -271,7 +267,7 @@ export class WorkspaceLeaseManager {
 
   async withLock(callback) {
     await mkdir(this.leaseRoot, { recursive: true });
-    const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+    const deadline = Date.now() + 2_000;
     while (true) {
       try {
         await mkdir(this.lockPath);
@@ -281,8 +277,8 @@ export class WorkspaceLeaseManager {
         if (Date.now() >= deadline) throw new Error("CDB 工作台 lease 正忙，请重试。");
         try {
           const lockStat = await stat(this.lockPath);
-          if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
-            await removeLockDirectory(this.lockPath);
+          if (Date.now() - lockStat.mtimeMs > 5_000) {
+            await rm(this.lockPath, { recursive: true, force: true });
           }
         } catch {}
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -291,16 +287,8 @@ export class WorkspaceLeaseManager {
     try {
       return await callback();
     } finally {
-      await removeLockDirectory(this.lockPath);
+      await rm(this.lockPath, { recursive: true, force: true });
     }
-  }
-}
-
-async function removeLockDirectory(lockPath) {
-  try {
-    await rmdir(lockPath);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
   }
 }
 
@@ -318,6 +306,24 @@ function publicLease(lease) {
 
 function isExpired(lease) {
   return !lease?.expiresAt || Date.parse(lease.expiresAt) <= Date.now();
+}
+
+function isOwnerProcessAlive(lease) {
+  const ownerPid = Number(lease?.ownerPid);
+  if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return true;
+  try {
+    process.kill(ownerPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function removeLeaseSecret(lease, leaseRoot) {
+  if (!lease?.leaseId || !lease?.controlSecretRef) return;
+  const expected = path.join(path.resolve(leaseRoot), `${lease.leaseId}.secret`);
+  if (path.resolve(lease.controlSecretRef) !== expected) return;
+  await rm(expected, { force: true });
 }
 
 async function requestControl(lease, route, { method, body } = {}, leaseRoot) {

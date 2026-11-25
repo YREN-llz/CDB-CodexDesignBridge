@@ -1,20 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { solidVisualReference } from "./helpers/visual-reference.js";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { WebSocket } from "ws";
+import { WebSocket } from "../codex-plugin/codex-design-bridge/vendor/ws/wrapper.mjs";
 import { commitPatchTransaction } from "../codex-plugin/codex-design-bridge/mcp/patch-transaction.mjs";
-import { createFigmaSeedProject } from "../codex-plugin/codex-design-bridge/mcp/project-contract.mjs";
 
 const pluginRoot = process.env.DESIGN_WORKSPACE_PLUGIN_ROOT
   ? path.resolve(process.env.DESIGN_WORKSPACE_PLUGIN_ROOT)
   : path.resolve("codex-plugin", "codex-design-bridge");
 const serverPath = path.join(pluginRoot, "mcp", "server.mjs");
-let clientRegistrySequence = 0;
 
 test("publishes one CDB launcher entry with direct project actions", async () => {
   const manifest = JSON.parse(
@@ -47,7 +46,7 @@ test("publishes one CDB launcher entry with direct project actions", async () =>
   assert.deepEqual([...icon.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
   assert.match(skill, /name: start-design/);
   assert.match(skill, /Bare invocation/);
-  assert.match(skill, /open_design_launcher/);
+  assert.match(skill, /open_cdb/);
   assert.match(skill, /create_design_project/);
   assert.match(skill, /create_figma_seed_project/);
   assert.match(skill, /open_design_workspace/);
@@ -69,12 +68,14 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   assert.equal(initialized.capabilities.tools.listChanged, false);
 
   const listed = await client.request("tools/list");
+  assert.ok(listed.tools.some((tool) => tool.name === "open_cdb"));
+  assert.ok(listed.tools.some((tool) => tool.name === "get_cdb_health"));
   const openTool = listed.tools.find(
     (tool) => tool.name === "open_design_workspace",
   );
   assert.ok(openTool);
   assert.equal(
-    openTool._meta["ui.resourceUri"],
+    openTool._meta.ui.resourceUri,
     "ui://codex-design-bridge/workspace-v2.html",
   );
   assert.ok(
@@ -94,6 +95,13 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   );
   assert.ok(
     listed.tools.some(
+      (tool) => tool.name === "get_design_verification_images",
+    ),
+  );
+  assert.ok(listed.tools.some((tool) => tool.name === "focus_figma_design_node"));
+  assert.ok(listed.tools.some((tool) => tool.name === "get_design_source_location"));
+  assert.ok(
+    listed.tools.some(
       (tool) => tool.name === "open_design_preview_in_browser",
     ),
   );
@@ -108,27 +116,10 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   assert.ok(managePageTool);
   assert.deepEqual(
     managePageTool.inputSchema.properties.action.enum,
-    ["select"],
+    ["select", "remove"],
   );
   assert.ok(listed.tools.some((tool) => tool.name === "open_design_launcher"));
   assert.ok(listed.tools.some((tool) => tool.name === "resolve_design_source"));
-  const locationTool = listed.tools.find(
-    (tool) => tool.name === "choose_local_project_location",
-  );
-  assert.ok(locationTool);
-  assert.equal(locationTool.annotations.readOnlyHint, true);
-  assert.deepEqual(locationTool.inputSchema.properties.purpose.enum, [
-    "design",
-    "figma",
-    "open",
-  ]);
-  assert.ok(listed.tools.some((tool) => tool.name === "list_design_projects"));
-  assert.ok(
-    listed.tools.some(
-      (tool) => tool.name === "open_registered_design_project",
-    ),
-  );
-  assert.ok(listed.tools.some((tool) => tool.name === "forget_design_project"));
   assert.ok(listed.tools.some((tool) => tool.name === "create_design_project"));
   assert.ok(listed.tools.some((tool) => tool.name === "create_figma_seed_project"));
   assert.ok(listed.tools.some((tool) => tool.name === "preflight_design_project"));
@@ -194,28 +185,26 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   assert.match(resource.contents[0].text, /id="primaryButtonLabel">当前页面/);
   assert.match(resource.contents[0].text, /全部发送到 Figma/);
   assert.match(resource.contents[0].text, /id="receiveButton"/);
-  assert.match(resource.contents[0].text, /让 Codex 处理/);
+  assert.match(resource.contents[0].text, /重试处理/);
   assert.match(resource.contents[0].text, /handoffPendingFigmaChanges/);
   assert.match(resource.contents[0].text, /sendFollowUpMessage/);
-  assert.match(resource.contents[0].text, /choose_local_project_location/);
-  assert.match(resource.contents[0].text, /id="launcherProjectsTitle">项目管理/);
-  assert.match(resource.contents[0].text, /id="projectMenuButton"/);
-  assert.match(resource.contents[0].text, /id="projectDialog"/);
-  assert.match(resource.contents[0].text, /打开本地项目/);
-  assert.match(resource.contents[0].text, /list_design_projects/);
-  assert.match(resource.contents[0].text, /open_registered_design_project/);
-  assert.match(resource.contents[0].text, /forget_design_project/);
-  assert.match(resource.contents[0].text, /本地项目文件未删除/);
-  assert.match(resource.contents[0].text, /选择位置并新建/);
-  assert.match(resource.contents[0].text, /createLocalProject/);
-  assert.doesNotMatch(
+  assert.match(
     resource.contents[0].text,
     /void handoffPendingFigmaChanges\(\);/,
   );
-  assert.match(resource.contents[0].text, /Figma→Codex 单向回传/);
+  assert.match(resource.contents[0].text, /CDB Figma→Codex 自动处理/);
+  assert.match(resource.contents[0].text, /不要调用 open_design_launcher/);
+  assert.match(resource.contents[0].text, /处理完成/);
   assert.match(resource.contents[0].text, /send_preview_to_local_figma/);
   assert.match(resource.contents[0].text, /manage_design_workspace_page/);
   assert.match(resource.contents[0].text, /get_design_preview_image/);
+  assert.match(resource.contents[0].text, /get_design_verification_images/);
+  assert.match(resource.contents[0].text, /focus_figma_design_node/);
+  assert.match(resource.contents[0].text, /get_design_source_location/);
+  assert.match(resource.contents[0].text, /id="verificationDialog"/);
+  assert.match(resource.contents[0].text, /id="sourceLocationDialog"/);
+  assert.match(resource.contents[0].text, /id="verificationReviewCanvas"/);
+  assert.match(resource.contents[0].text, /id="verificationNodeHighlight"/);
   assert.match(resource.contents[0].text, /report_design_workspace_mounted/);
   assert.match(resource.contents[0].text, /undo_last_design_patch/);
   assert.match(
@@ -241,7 +230,11 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
     resource.contents[0].text,
     /#resultSummary\s*\{[^}]*font-size:\s*11px;[^}]*font-weight:\s*400;/s,
   );
-  assert.match(resource.contents[0].text, /视图缩放 · 100%/);
+  assert.match(resource.contents[0].text, /id="previewModeSelect"/);
+  assert.match(resource.contents[0].text, /验收 320/);
+  assert.match(resource.contents[0].text, /验收 1440/);
+  assert.match(resource.contents[0].text, /id="verificationCard"/);
+  assert.match(resource.contents[0].text, /已通过真实渲染验收/);
   assert.match(resource.contents[0].text, /let previewZoom = 100;/);
   assert.match(resource.contents[0].text, /PREVIEW_MAX_ZOOM = 300/);
   assert.match(resource.contents[0].text, /PREVIEW_MIN_ZOOM = 50/);
@@ -256,7 +249,7 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   assert.match(resource.contents[0].text, /按住拖拽视图/);
   assert.match(
     resource.contents[0].text,
-    /previewZoom <= 100\) resetPreviewPan\(\)/,
+    /previewZoom <= 100 && previewMode !== "one-to-one"\) resetPreviewPan\(\)/,
   );
   assert.match(resource.contents[0].text, /Math\.abs\(scaledWidth - stageWidth\)/);
   assert.match(resource.contents[0].text, /activePage\?\.viewport/);
@@ -274,7 +267,9 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   );
   assert.match(resource.contents[0].text, /mode: requestedMode/);
   assert.match(resource.contents[0].text, /\? "inline" : "fullscreen"/);
-  assert.doesNotMatch(resource.contents[0].text, /data-page-remove/);
+  assert.match(resource.contents[0].text, /id="removePageButton"/);
+  assert.match(resource.contents[0].text, /id="removePageDialog"/);
+  assert.match(resource.contents[0].text, /HTML、CSS、图片和 Figma 画布都会保留/);
   assert.doesNotMatch(resource.contents[0].text, /className = "page-path"/);
   assert.match(resource.contents[0].text, /id="launcherView"/);
   assert.match(resource.contents[0].text, /id="launcherFigma"/);
@@ -306,7 +301,7 @@ test("opens the active localhost preview route through the browser helper", asyn
   const projectDir = await mkdtemp(
     path.join(os.tmpdir(), "design-workspace-browser-open-"),
   );
-  const capturePath = path.join(projectDir, "browser-launch.json");
+  const capturePath = path.join(projectDir, "opened-url.txt");
   await writeFile(
     path.join(projectDir, "index.html"),
     '<!doctype html><title>Browser open</title><main data-codex-root data-codex-id="home-root"><h1 data-codex-id="home-title">Ready</h1></main>',
@@ -322,7 +317,7 @@ test("opens the active localhost preview route through the browser helper", asyn
     { id: "design", name: "Design", entry: "design.html", route: "/design.html" },
   ]);
   const client = startClient({
-    CODEX_DESIGN_BRIDGE_BROWSER_LAUNCH_CAPTURE_PATH: capturePath,
+    CODEX_DESIGN_BRIDGE_BROWSER_OPEN_CAPTURE_PATH: capturePath,
   });
   t.after(async () => {
     await client.close();
@@ -357,20 +352,13 @@ test("opens the active localhost preview route through the browser helper", asyn
     name: "open_design_preview_in_browser",
     arguments: { projectDir, pageId: designPage.id },
   });
-  const launch = JSON.parse(await readFile(capturePath, "utf8"));
-  const openedUrl = new URL(launch.args.at(-1));
+  const openedUrl = new URL(await readFile(capturePath, "utf8"));
   assert.equal(openedUrl.hostname, "127.0.0.1");
   assert.equal(openedUrl.pathname, "/design.html");
-  if (process.platform === "win32") {
-    const windowsRoot =
-      process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
-    assert.equal(
-      launch.command,
-      path.join(windowsRoot, "System32", "rundll32.exe"),
-    );
-    assert.equal(path.isAbsolute(launch.command), true);
-    assert.equal(launch.args[0], "url.dll,FileProtocolHandler");
-  }
+  assert.equal(openedUrl.searchParams.get("__cdb_viewport"), "1440x900");
+  const browserPreviewHtml = await (await fetch(openedUrl)).text();
+  assert.match(browserPreviewHtml, /data-cdb-browser-preview/);
+  assert.match(browserPreviewHtml, /width: 1440px; height: 900px/);
   assert.match(opened.structuredContent.workspace.message, /默认浏览器/);
 });
 
@@ -410,6 +398,7 @@ test("opens an unbound launcher and creates a ready native design without questi
       workspaceDir,
       projectName: "direct-design",
       description: "A focused launch page for a small typography studio",
+      viewport: { width: 1200, height: 1600 },
     },
   });
   const workspace = created.structuredContent.workspace;
@@ -419,9 +408,7 @@ test("opens an unbound launcher and creates a ready native design without questi
   assert.match(workspace.projectName, /typography stu/i);
   assert.equal(workspace.preflightReport.status, "pass");
   assert.equal(workspace.lease.owned, true);
-  assert.equal(workspace.projectKey, workspace.preflightReport.projectKey);
-  assert.equal(workspace.projectCatalog.length, 1);
-  assert.equal(workspace.projectCatalog[0].active, true);
+  assert.deepEqual(workspace.pages[0].viewport, { width: 1200, height: 1600 });
   for (const relative of [
     "index.html",
     "styles.css",
@@ -430,6 +417,13 @@ test("opens an unbound launcher and creates a ready native design without questi
   ]) {
     assert.ok(await readFile(path.join(workspace.projectDir, relative), "utf8"));
   }
+
+  const resumed = await client.request("tools/call", {
+    name: "open_cdb",
+    arguments: { action: "auto", workspaceDir },
+  });
+  assert.equal(resumed.structuredContent.workspace.mode, "workspace");
+  assert.equal(resumed.structuredContent.workspace.projectDir, workspace.projectDir);
 
   const seeded = await client.request("tools/call", {
     name: "create_figma_seed_project",
@@ -440,7 +434,6 @@ test("opens an unbound launcher and creates a ready native design without questi
   assert.equal(seedWorkspace.phase, "ready", JSON.stringify(seedWorkspace));
   assert.equal(path.basename(seedWorkspace.projectDir), "figma-first");
   assert.equal(seedWorkspace.pages[0].acceptsFigmaSeed, true);
-  assert.equal(seedWorkspace.pages[0].id, "figma-first-home");
   const seedManifest = JSON.parse(
     await readFile(
       path.join(seedWorkspace.projectDir, ".cdb", "manifest.json"),
@@ -448,42 +441,1001 @@ test("opens an unbound launcher and creates a ready native design without questi
     ),
   );
   assert.equal(seedManifest.source.kind, "figma-seed");
+});
 
-  const listedProjects = await client.request("tools/call", {
-    name: "list_design_projects",
-    arguments: {},
+test("creates a local project from a protocol 16 offer and returns stable Figma mappings", async (t) => {
+  const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "cdb-offer-create-project-"));
+  const leaseRoot = await mkdtemp(path.join(os.tmpdir(), "cdb-offer-create-lease-"));
+  const bridgePort = await getFreePort();
+  const client = startClient({
+    CODEX_DESIGN_BRIDGE_PORT: String(bridgePort),
+    CODEX_DESIGN_BRIDGE_LEASE_ROOT: leaseRoot,
   });
-  assert.equal(listedProjects.structuredContent.projectCatalog.length, 2);
+  let socket;
+  t.after(async () => {
+    socket?.close();
+    await client.close();
+    await rm(workspaceDir, { recursive: true, force: true });
+    await rm(leaseRoot, { recursive: true, force: true });
+  });
+  await client.request("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "test", version: "1.0.0" },
+  });
+  const launched = await client.request("tools/call", {
+    name: "open_design_launcher",
+    arguments: { workspaceDir },
+  });
+  const launcherId = launched.structuredContent.workspace.launcherId;
+  const pairing = await fetch(`http://localhost:${bridgePort}/api/pair`, {
+    headers: { origin: "https://www.figma.com" },
+  }).then((response) => response.json());
+  socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  const sessionId = "session-create-project-1234";
+  const readyPromise = waitForSocketMessage(socket, "plugin.ready");
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    ...protocol16(),
+    pluginVersion: manifestVersion().split("+")[0],
+    sessionId,
+    projectKey: "",
+    importedAssetIds: [],
+    importedPageIds: [],
+  }));
+  await readyPromise;
+
+  const offerId = "offer-create-project-1234";
+  const offerAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
+  socket.send(JSON.stringify({
+    type: "figma.design.offer",
+    responsiveContract: responsiveContract(390, 1560),
+    ...protocol16(),
+    offerId,
+    sessionId,
+    figmaFileKey: "figma-file-create-project",
+    rootNodeId: "84:1",
+    rootName: "New Site",
+    rootType: "FRAME",
+    width: 390,
+    height: 1560,
+    estimatedNodeCount: 1,
+    linkedProjectKey: "old-project-key",
+    linkedPageId: "old-page-id",
+    createdAt: new Date().toISOString(),
+  }));
+  assert.equal((await offerAckPromise).state, "pending");
+
+  const acceptMessage = waitForSocketMessage(socket, "figma.design.accept");
+  await client.request("tools/call", {
+    name: "accept_figma_design_offer",
+    arguments: { offerId, action: "create_project", launcherId, workspaceDir },
+  });
+  assert.equal((await acceptMessage).target.action, "create_project");
+
+  const resultPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify({
+    type: "figma.design.payload",
+    responsiveContract: responsiveContract(390, 1560),
+    ...protocol16(),
+    offerId,
+    sessionId,
+    figma: {
+      fileKey: "figma-file-create-project",
+      pageId: "7:1",
+      pageName: "Designs",
+      rootNodeId: "84:1",
+      rootNodeName: "New Site",
+    },
+    pageSeed: {
+      node: {
+        id: "new-site-root",
+        type: "frame",
+        tag: "main",
+        name: "New Site",
+        width: 390,
+        height: 1560,
+        opacity: 1,
+        visible: true,
+        rotation: 0,
+        style: { fill: "#ffffff" },
+        children: [],
+      },
+    },
+    referenceImage: solidVisualReference(390, 1560),
+    report: {
+      nodeCount: 1,
+      resourceBytes: 0,
+      resourceCount: 0,
+      degradations: [],
+    },
+    capturedAt: new Date().toISOString(),
+  }));
+  const result = await resultPromise;
+  assert.equal(result.state, "completed", JSON.stringify(result));
+  assert.equal(result.result.action, "create_project");
+  assert.equal(result.result.pageId, offerId);
+  assert.notEqual(result.result.pageId, "old-page-id");
+  assert.equal(result.result.entry, "index.html");
+  assert.equal(result.result.route, "/");
+  assert.equal(result.result.rootNodeId, "84:1");
+  assert.equal(result.result.verification.status, "passed");
+  assert.equal(result.result.verification.visual.status, "passed");
+  assert.equal(result.result.nodeMappings.length, 1);
+  assert.equal(result.result.nodeMappings[0].figmaNodeId, "84:1");
+  assert.equal(result.result.nodeMappings[0].sourceRef.file, "index.html");
+
+  const projectDir = result.result.projectDir;
+  const manifest = JSON.parse(await readFile(path.join(projectDir, ".cdb", "manifest.json"), "utf8"));
+  assert.deepEqual(manifest.pages[0].viewport, { width: 390, height: 1560 });
+  const baseline = JSON.parse(
+    await readFile(
+      path.join(projectDir, ".cdb", "sync-baselines", `${result.result.pageId}.json`),
+      "utf8",
+    ),
+  );
+  assert.equal(baseline.sourceHash, result.result.sourceHash);
+  assert.equal(baseline.figma.rootNodeId, "84:1");
+  assert.equal(baseline.nodeMappings[0].sourceRef.file, "index.html");
+  assert.ok(await readFile(path.join(projectDir, "index.html"), "utf8"));
+  assert.ok(await readFile(path.join(projectDir, "styles.css"), "utf8"));
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const synchronized = await client.request("tools/call", {
+    name: "get_design_workspace_state",
+    arguments: { projectDir },
+  });
+  const synchronizedWorkspace = synchronized.structuredContent.workspace;
+  const synchronizedPage = synchronizedWorkspace.pages.find(
+    (candidate) => candidate.id === result.result.pageId,
+  );
+  assert.equal(synchronizedWorkspace.figmaReady, true);
+  assert.equal(synchronizedPage.figmaReady, true);
+  assert.equal(synchronizedPage.syncState, "synced");
+  assert.equal(synchronizedPage.sourceHash, baseline.sourceHash);
+
+  const transitioned = await client.request("tools/call", {
+    name: "get_figma_design_offers",
+    arguments: { launcherId },
+  });
+  const transitionedWorkspace = transitioned.structuredContent.workspace;
+  assert.equal(transitionedWorkspace.mode, "workspace");
+  assert.equal(transitionedWorkspace.projectDir, projectDir);
+  assert.equal(transitionedWorkspace.activePageId, result.result.pageId);
+  assert.equal(transitionedWorkspace.sessionActive, true);
+
+  await client.request("tools/call", {
+    name: "end_design_session",
+    arguments: { projectDir },
+  });
+  socket.close();
+
+  const relaunched = await client.request("tools/call", {
+    name: "open_design_launcher",
+    arguments: { workspaceDir },
+  });
+  const updateLauncherId = relaunched.structuredContent.workspace.launcherId;
+  const updatePairing = await fetch(`http://localhost:${bridgePort}/api/pair`, {
+    headers: { origin: "https://www.figma.com" },
+  }).then((response) => response.json());
+  socket = new WebSocket(`${updatePairing.wsUrl}?token=${updatePairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  const updateSessionId = "session-launcher-update-1234";
+  const updateReadyPromise = waitForSocketMessage(socket, "plugin.ready");
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    ...protocol16(),
+    pluginVersion: manifestVersion().split("+")[0],
+    sessionId: updateSessionId,
+    projectKey: "",
+    importedAssetIds: [],
+    importedPageIds: [],
+  }));
+  await updateReadyPromise;
+
+  const updateOfferId = "offer-launcher-update-1234";
+  const updateAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
+  socket.send(JSON.stringify({
+    type: "figma.design.offer",
+    responsiveContract: responsiveContract(390, 1560),
+    ...protocol16(),
+    offerId: updateOfferId,
+    sessionId: updateSessionId,
+    figmaFileKey: "figma-file-create-project",
+    rootNodeId: "84:1",
+    rootName: "New Site",
+    rootType: "FRAME",
+    width: 390,
+    height: 1560,
+    estimatedNodeCount: 1,
+    linkedProjectKey: result.result.projectKey,
+    linkedPageId: result.result.pageId,
+    createdAt: new Date().toISOString(),
+  }));
+  assert.equal((await updateAckPromise).state, "pending");
+
+  const updateAcceptPromise = waitForSocketMessage(socket, "figma.design.accept");
+  await client.request("tools/call", {
+    name: "accept_figma_design_offer",
+    arguments: {
+      offerId: updateOfferId,
+      action: "update_page",
+      launcherId: updateLauncherId,
+      projectDir,
+      pageId: result.result.pageId,
+    },
+  });
+  assert.equal((await updateAcceptPromise).target.action, "update_page");
+
+  const updateResultPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify({
+    type: "figma.design.payload",
+    responsiveContract: responsiveContract(390, 1560),
+    ...protocol16(),
+    offerId: updateOfferId,
+    sessionId: updateSessionId,
+    figma: {
+      fileKey: "figma-file-create-project",
+      pageId: "7:1",
+      pageName: "Designs",
+      rootNodeId: "84:1",
+      rootNodeName: "New Site",
+    },
+    pageSeed: {
+      node: {
+        id: "new-site-root",
+        type: "frame",
+        tag: "main",
+        name: "New Site",
+        width: 390,
+        height: 1560,
+        opacity: 0.96,
+        visible: true,
+        rotation: 0,
+        style: { fill: "#ffffff" },
+        children: [],
+      },
+    },
+    referenceImage: solidVisualReference(390, 1560),
+    report: {
+      nodeCount: 1,
+      resourceBytes: 0,
+      resourceCount: 0,
+      degradations: [],
+    },
+    capturedAt: new Date().toISOString(),
+  }));
+  const updateResult = await updateResultPromise;
+  assert.equal(updateResult.state, "completed", JSON.stringify(updateResult));
+  assert.equal(updateResult.result.action, "update_page");
+  assert.equal(updateResult.result.pageId, result.result.pageId);
+  assert.equal(updateResult.result.rootNodeId, "84:1");
+  assert.equal(updateResult.result.nodeMappings.length, 1);
+  assert.equal(updateResult.result.nodeMappings[0].figmaNodeId, "84:1");
+  assert.match(
+    await readFile(path.join(projectDir, "styles.css"), "utf8"),
+    /opacity:\s*0\.96/,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const updated = await client.request("tools/call", {
+    name: "get_design_workspace_state",
+    arguments: { projectDir },
+  });
+  const updatedWorkspace = updated.structuredContent.workspace;
+  const updatedPage = updatedWorkspace.pages.find(
+    (candidate) => candidate.id === result.result.pageId,
+  );
+  assert.equal(updatedWorkspace.phase, "in_figma");
+  assert.equal(updatedPage.syncState, "synced");
+  assert.notEqual(updatedPage.sourceHash, baseline.sourceHash);
+  assert.equal(updatedWorkspace.pendingChangeCount, 0);
+});
+
+test("accepts a protocol 16 offer into an existing local project as a new page", async (t) => {
+  const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "cdb-offer-add-page-"));
+  const leaseRoot = await mkdtemp(path.join(os.tmpdir(), "cdb-offer-add-page-lease-"));
+  const bridgePort = await getFreePort();
+  const client = startClient({
+    CODEX_DESIGN_BRIDGE_PORT: String(bridgePort),
+    CODEX_DESIGN_BRIDGE_LEASE_ROOT: leaseRoot,
+  });
+  let socket;
+  t.after(async () => {
+    socket?.close();
+    await client.close();
+    await rm(workspaceDir, { recursive: true, force: true });
+    await rm(leaseRoot, { recursive: true, force: true });
+  });
+  await client.request("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "test", version: "1.0.0" },
+  });
+  const created = await client.request("tools/call", {
+    name: "create_design_project",
+    arguments: {
+      workspaceDir,
+      projectName: "existing-project",
+      description: "Existing local project",
+    },
+  });
+  const projectDir = created.structuredContent.workspace.projectDir;
+  const projectKey = created.structuredContent.workspace.preflightReport.projectKey;
+  const pairing = await fetch(`http://localhost:${bridgePort}/api/pair`, {
+    headers: { origin: "https://www.figma.com" },
+  }).then((response) => response.json());
+  socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  const sessionId = "session-add-page-1234";
+  const readyPromise = waitForSocketMessage(socket, "plugin.ready");
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    ...protocol16(),
+    pluginVersion: manifestVersion().split("+")[0],
+    sessionId,
+    projectKey,
+    importedAssetIds: [],
+    importedPageIds: [],
+  }));
+  await readyPromise;
+
+  const offerId = "offer-add-page-1234";
+  const offerAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
+  socket.send(JSON.stringify({
+    type: "figma.design.offer",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId,
+    sessionId,
+    figmaFileKey: "figma-file-add-page",
+    rootNodeId: "42:10",
+    rootName: "Pricing",
+    rootType: "FRAME",
+    width: 1440,
+    height: 900,
+    estimatedNodeCount: 1,
+    linkedProjectKey: "",
+    linkedPageId: "",
+    createdAt: new Date().toISOString(),
+  }));
+  assert.equal((await offerAckPromise).state, "pending");
+
+  const acceptMessage = waitForSocketMessage(socket, "figma.design.accept");
+  await client.request("tools/call", {
+    name: "accept_figma_design_offer",
+    arguments: { offerId, action: "add_page", projectDir },
+  });
+  assert.equal((await acceptMessage).target.action, "add_page");
+
+  const resultPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify({
+    type: "figma.design.payload",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId,
+    sessionId,
+    figma: {
+      fileKey: "figma-file-add-page",
+      pageId: "7:1",
+      pageName: "Designs",
+      rootNodeId: "42:10",
+      rootNodeName: "Pricing",
+    },
+    pageSeed: {
+      node: {
+        id: "pricing-root",
+        type: "frame",
+        tag: "main",
+        name: "Pricing",
+        width: 1440,
+        height: 900,
+        opacity: 1,
+        visible: true,
+        rotation: 0,
+        style: { fill: "#ffffff" },
+        children: [],
+      },
+    },
+    referenceImage: solidVisualReference(1200, 750),
+    report: {
+      nodeCount: 1,
+      resourceBytes: 0,
+      resourceCount: 0,
+      degradations: [],
+    },
+    capturedAt: new Date().toISOString(),
+  }));
+  const result = await resultPromise;
+  assert.equal(result.state, "completed", JSON.stringify(result));
+  assert.equal(result.result.action, "add_page");
+  assert.equal(result.result.projectDir, projectDir);
+  assert.equal(result.result.preflightStatus, "pass");
+  assert.equal(result.result.verification.status, "passed");
+  assert.equal(result.result.verification.visual.status, "passed");
+  assert.ok(result.result.transactionId);
+  assert.equal(result.result.rootNodeId, "42:10");
+  assert.equal(result.result.nodeMappings.length, 1);
+  assert.equal(result.result.nodeMappings[0].figmaNodeId, "42:10");
+
+  const manifest = JSON.parse(
+    await readFile(path.join(projectDir, ".cdb", "manifest.json"), "utf8"),
+  );
+  assert.equal(manifest.pages.length, 2);
+  assert.equal(manifest.pages[1].entry, "pricing.html");
+  assert.ok(await readFile(path.join(projectDir, "pricing.css"), "utf8"));
+  const baseline = JSON.parse(
+    await readFile(
+      path.join(projectDir, ".cdb", "sync-baselines", `${result.result.pageId}.json`),
+      "utf8",
+    ),
+  );
+  assert.equal(baseline.figma.rootNodeId, "42:10");
+  assert.equal(baseline.sourceHash, result.result.sourceHash);
+  const synchronized = await client.request("tools/call", {
+    name: "get_design_workspace_state",
+    arguments: { projectDir },
+  });
+  const synchronizedPage = synchronized.structuredContent.workspace.pages.find(
+    (page) => page.id === result.result.pageId,
+  );
+  assert.equal(synchronizedPage.sourceHash, baseline.sourceHash);
+  assert.equal(synchronizedPage.pageIrHash, baseline.pageIrHash);
+  assert.equal(synchronizedPage.figmaReady, true);
+  assert.equal(synchronizedPage.syncState, "synced");
+
+  const updateOfferId = "offer-update-page-1234";
+  const updateAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
+  socket.send(JSON.stringify({
+    type: "figma.design.offer",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId: updateOfferId,
+    sessionId,
+    figmaFileKey: "figma-file-add-page",
+    rootNodeId: "42:10",
+    rootName: "Pricing",
+    rootType: "FRAME",
+    width: 1440,
+    height: 900,
+    estimatedNodeCount: 1,
+    linkedProjectKey: projectKey,
+    linkedPageId: result.result.pageId,
+    createdAt: new Date().toISOString(),
+  }));
+  assert.equal((await updateAckPromise).state, "pending");
+  const updateAcceptMessage = waitForSocketMessage(socket, "figma.design.accept");
+  await client.request("tools/call", {
+    name: "accept_figma_design_offer",
+    arguments: {
+      offerId: updateOfferId,
+      action: "update_page",
+      projectDir,
+      pageId: result.result.pageId,
+    },
+  });
+  assert.equal((await updateAcceptMessage).target.action, "update_page");
+  const updateResultPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify({
+    type: "figma.design.payload",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId: updateOfferId,
+    sessionId,
+    figma: {
+      fileKey: "figma-file-add-page",
+      pageId: "7:1",
+      pageName: "Designs",
+      rootNodeId: "42:10",
+      rootNodeName: "Pricing",
+    },
+    pageSeed: {
+      node: {
+        id: "pricing-root",
+        type: "frame",
+        tag: "main",
+        name: "Pricing",
+        width: 1440,
+        height: 900,
+        opacity: 1,
+        visible: true,
+        rotation: 0,
+        style: { fill: "#111111" },
+        children: [],
+      },
+    },
+    referenceImage: solidVisualReference(1200, 750, [17, 17, 17, 255]),
+    report: {
+      nodeCount: 1,
+      resourceBytes: 0,
+      resourceCount: 0,
+      degradations: [],
+    },
+    capturedAt: new Date().toISOString(),
+  }));
+  const updateResult = await updateResultPromise;
+  assert.equal(updateResult.state, "completed", JSON.stringify(updateResult));
+  assert.equal(updateResult.result.action, "update_page");
+  assert.equal(updateResult.result.rootNodeId, "42:10");
+  assert.equal(updateResult.result.nodeMappings.length, 1);
+  assert.equal(updateResult.result.nodeMappings[0].figmaNodeId, "42:10");
+  assert.notEqual(updateResult.result.sourceHash, result.result.sourceHash);
+  assert.match(
+    await readFile(path.join(projectDir, "pricing.css"), "utf8"),
+    /background-color:\s*#111111/i,
+  );
+  const replayPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify({
+    type: "figma.design.result.query",
+    ...protocol16(),
+    offerId: updateOfferId,
+    sessionId,
+  }));
+  const replay = await replayPromise;
+  assert.equal(replay.state, "completed");
+  assert.equal(replay.result.action, "update_page");
+  assert.equal(replay.result.transactionId, updateResult.result.transactionId);
+
+  const pricingCssPath = path.join(projectDir, "pricing.css");
+  await writeFile(
+    pricingCssPath,
+    (await readFile(pricingCssPath, "utf8")).replaceAll("#111111", "#222222"),
+    "utf8",
+  );
+  const refreshed = await client.request("tools/call", {
+    name: "refresh_design_workspace",
+    arguments: { projectDir },
+  });
+  const pricingPage = refreshed.structuredContent.workspace.pages.find(
+    (page) => page.id === result.result.pageId,
+  );
+  assert.equal(pricingPage.syncState, "source_changed");
+  const conflictAckPromise = waitForSocketMessage(socket, "page.changes.ack", 10_000);
+  socket.send(JSON.stringify({
+    type: "page.changes.record",
+    requestId: "pricing-conflict-request",
+    changeSet: {
+      ...protocol16(),
+      changeSetId: "pricing-conflict-change",
+      pageId: result.result.pageId,
+      sourceHash: pricingPage.sourceHash,
+      changes: [{
+        nodeId: "pricing-root",
+        nodeType: "FRAME",
+        category: "visual",
+        property: "fill",
+        sourceRef: {
+          file: "pricing.html",
+          selector: '[data-codex-id="pricing-root"]',
+        },
+        from: { color: "#111111", opacity: 1 },
+        to: { color: "#333333", opacity: 1 },
+      }],
+      annotations: [],
+      figma: {
+        fileKey: "figma-file-add-page",
+        pageId: "7:1",
+        rootNodeId: "42:10",
+        rootNodeName: "Pricing",
+      },
+      pageSnapshot: {
+        responsiveContract: responsiveContract(),
+        pageSeed: {
+          node: {
+            id: "pricing-root",
+            type: "frame",
+            tag: "main",
+            name: "Pricing",
+            width: 1440,
+            height: 900,
+            opacity: 1,
+            visible: true,
+            rotation: 0,
+            style: { fill: { color: "#333333", opacity: 1 } },
+            children: [],
+          },
+        },
+        report: {
+          nodeCount: 1,
+          resourceBytes: 0,
+          resourceCount: 0,
+          degradations: [],
+        },
+        capturedAt: new Date().toISOString(),
+      },
+    },
+  }));
+  const conflictAck = await conflictAckPromise;
+  assert.equal(conflictAck.state, "pending", JSON.stringify(conflictAck));
+  assert.ok(conflictAck.fastApply.conflicts.length >= 1);
+  const htmlUpsertPromise = waitForSocketMessage(socket, "page.upsert", 15_000);
+  const acceptHtmlPromise = client.request("tools/call", {
+    name: "resolve_design_sync_conflict",
+    arguments: { projectDir, resolution: "html" },
+  });
+  const htmlUpsert = await htmlUpsertPromise;
+  assert.equal(htmlUpsert.page.conflictResolution.direction, "html");
+  assert.match(
+    htmlUpsert.page.conflictResolution.transactionId,
+    /^conflict-html:/,
+  );
+  socket.send(JSON.stringify({
+    type: "page.import.result",
+    result: {
+      ok: true,
+      pageId: result.result.pageId,
+      sourceHash: htmlUpsert.page.sourceHash,
+      nodes: 1,
+      nodeId: "42:10",
+      fileKey: "figma-file-add-page",
+      figmaPageId: "7:1",
+      transactionId: htmlUpsert.page.conflictResolution.transactionId,
+      nodeMappings: [{
+        pageNodeId: "pricing-root",
+        figmaNodeId: "42:10",
+        nodeType: "frame",
+        sourceRef: {
+          file: "pricing.html",
+          selector: '[data-codex-id="pricing-root"]',
+        },
+      }],
+    },
+  }));
+  const acceptedHtml = await acceptHtmlPromise;
   assert.equal(
-    listedProjects.structuredContent.projectCatalog.filter((project) => project.active).length,
-    1,
-  );
-
-  const switched = await client.request("tools/call", {
-    name: "open_registered_design_project",
-    arguments: { projectKey: workspace.projectKey },
-  });
-  assert.equal(switched.structuredContent.workspace.projectKey, workspace.projectKey);
-  assert.equal(switched.structuredContent.workspace.preflightReport.status, "pass");
-  assert.equal(switched.structuredContent.workspace.projectCatalog.length, 2);
-
-  const forgotten = await client.request("tools/call", {
-    name: "forget_design_project",
-    arguments: { projectKey: seedWorkspace.projectKey },
-  });
-  assert.deepEqual(
-    forgotten.structuredContent.projectCatalog.map((project) => project.projectKey),
-    [workspace.projectKey],
+    acceptedHtml.structuredContent.workspace.lastConflictResolution,
+    "html",
   );
   assert.equal(
-    JSON.parse(
-      await readFile(
-        path.join(seedWorkspace.projectDir, ".cdb", "manifest.json"),
-        "utf8",
-      ),
-    ).source.kind,
-    "figma-seed",
+    acceptedHtml.structuredContent.workspace.lastTransactionId,
+    htmlUpsert.page.conflictResolution.transactionId,
   );
+  assert.match(await readFile(pricingCssPath, "utf8"), /#222222/i);
+
+  const htmlUndoRequestPromise = waitForSocketMessage(
+    socket,
+    "page.import.undo",
+  );
+  const undoHtmlPromise = client.request("tools/call", {
+    name: "undo_design_sync_conflict_resolution",
+    arguments: { projectDir },
+  });
+  const htmlUndoRequest = await htmlUndoRequestPromise;
+  assert.equal(htmlUndoRequest.pageId, result.result.pageId);
+  assert.equal(
+    htmlUndoRequest.transactionId,
+    htmlUpsert.page.conflictResolution.transactionId,
+  );
+  socket.send(JSON.stringify({
+    type: "page.import.undo.result",
+    requestId: htmlUndoRequest.requestId,
+    pageId: htmlUndoRequest.pageId,
+    transactionId: htmlUndoRequest.transactionId,
+    sourceHash: updateResult.result.sourceHash,
+    ok: true,
+  }));
+  const undoneHtml = await undoHtmlPromise;
+  assert.ok(undoneHtml.structuredContent.workspace.syncConflicts.length >= 1);
+  assert.equal(
+    undoneHtml.structuredContent.workspace.pages.find(
+      (page) => page.id === result.result.pageId,
+    ).syncState,
+    "conflict",
+  );
+  assert.match(await readFile(pricingCssPath, "utf8"), /#222222/i);
+
+  const acceptedFigma = await client.request("tools/call", {
+    name: "resolve_design_sync_conflict",
+    arguments: { projectDir, resolution: "figma" },
+  });
+  assert.equal(acceptedFigma.structuredContent.workspace.lastConflictResolution, "figma");
+  assert.ok(acceptedFigma.structuredContent.workspace.lastResolvedConflictPath);
+  assert.match(await readFile(pricingCssPath, "utf8"), /#333333/i);
+  const undoneConflict = await client.request("tools/call", {
+    name: "undo_design_sync_conflict_resolution",
+    arguments: { projectDir },
+  });
+  assert.ok(undoneConflict.structuredContent.workspace.syncConflicts.length >= 1);
+  assert.equal(
+    undoneConflict.structuredContent.workspace.pages.find(
+      (page) => page.id === result.result.pageId,
+    ).syncState,
+    "conflict",
+  );
+  assert.match(await readFile(pricingCssPath, "utf8"), /#222222/i);
+
+  const reconnectOfferId = "offer-reconnect-page-1234";
+  const reconnectAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
+  socket.send(JSON.stringify({
+    type: "figma.design.offer",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId: reconnectOfferId,
+    sessionId,
+    figmaFileKey: "figma-file-add-page",
+    rootNodeId: "43:10",
+    rootName: "FAQ",
+    rootType: "FRAME",
+    width: 1440,
+    height: 900,
+    estimatedNodeCount: 1,
+    linkedProjectKey: "",
+    linkedPageId: "",
+    createdAt: new Date().toISOString(),
+  }));
+  assert.equal((await reconnectAckPromise).state, "pending");
+  const reconnectAcceptMessage = waitForSocketMessage(socket, "figma.design.accept");
+  await client.request("tools/call", {
+    name: "accept_figma_design_offer",
+    arguments: { offerId: reconnectOfferId, action: "add_page", projectDir },
+  });
+  await reconnectAcceptMessage;
+  await new Promise((resolve) => {
+    socket.once("close", resolve);
+    socket.close();
+  });
+
+  socket = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+    origin: "https://www.figma.com",
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  const reconnectReadyPromise = waitForSocketMessage(socket, "plugin.ready");
+  socket.send(JSON.stringify({
+    type: "plugin.hello",
+    ...protocol16(),
+    pluginVersion: manifestVersion().split("+")[0],
+    sessionId,
+    projectKey,
+    importedAssetIds: [],
+    importedPageIds: [],
+  }));
+  await reconnectReadyPromise;
+  const reconnectResultPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify({
+    type: "figma.design.payload",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId: reconnectOfferId,
+    sessionId,
+    figma: {
+      fileKey: "figma-file-add-page",
+      pageId: "7:1",
+      pageName: "Designs",
+      rootNodeId: "43:10",
+      rootNodeName: "FAQ",
+    },
+    pageSeed: {
+      node: {
+        id: "faq-root",
+        type: "frame",
+        tag: "main",
+        name: "FAQ",
+        width: 1440,
+        height: 900,
+        opacity: 1,
+        visible: true,
+        rotation: 0,
+        style: { fill: "#F5F5F5" },
+        children: [],
+      },
+    },
+    referenceImage: solidVisualReference(1200, 750, [245, 245, 245, 255]),
+    report: {
+      nodeCount: 1,
+      resourceBytes: 0,
+      resourceCount: 0,
+      degradations: [],
+    },
+    capturedAt: new Date().toISOString(),
+  }));
+  const reconnectResult = await reconnectResultPromise;
+  assert.equal(reconnectResult.state, "completed", JSON.stringify(reconnectResult));
+  assert.equal(reconnectResult.result.action, "add_page");
+  assert.equal(reconnectResult.result.entry, "faq.html");
+});
+
+test("restores an accepted protocol 16 offer and its completed result across server restarts", async (t) => {
+  const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "cdb-offer-restart-"));
+  const leaseRoot = await mkdtemp(path.join(os.tmpdir(), "cdb-offer-restart-lease-"));
+  const clients = [];
+  let socket;
+  t.after(async () => {
+    socket?.close();
+    await Promise.allSettled(clients.map((client) => client.close()));
+    await rm(workspaceDir, { recursive: true, force: true });
+    await rm(leaseRoot, { recursive: true, force: true });
+  });
+  const startPersistentClient = async () => {
+    const bridgePort = await getFreePort();
+    const client = startClient({
+      CODEX_DESIGN_BRIDGE_PORT: String(bridgePort),
+      CODEX_DESIGN_BRIDGE_LEASE_ROOT: leaseRoot,
+    });
+    clients.push(client);
+    await client.request("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "restart-test", version: "1.0.0" },
+    });
+    return { client, bridgePort };
+  };
+  const connectFigma = async (bridgePort, projectKey, sessionId) => {
+    const pairing = await fetch(`http://localhost:${bridgePort}/api/pair`, {
+      headers: { origin: "https://www.figma.com" },
+    }).then((response) => response.json());
+    const next = new WebSocket(`${pairing.wsUrl}?token=${pairing.token}`, {
+      origin: "https://www.figma.com",
+    });
+    await new Promise((resolve, reject) => {
+      next.once("open", resolve);
+      next.once("error", reject);
+    });
+    const readyPromise = waitForSocketMessage(next, "plugin.ready");
+    const inboxPromise = waitForSocketMessage(next, "figma.design.inbox");
+    next.send(JSON.stringify({
+      type: "plugin.hello",
+      ...protocol16(),
+      pluginVersion: manifestVersion().split("+")[0],
+      sessionId,
+      projectKey,
+      importedAssetIds: [],
+      importedPageIds: [],
+    }));
+    await readyPromise;
+    return { socket: next, inbox: await inboxPromise };
+  };
+
+  const first = await startPersistentClient();
+  const created = await first.client.request("tools/call", {
+    name: "create_design_project",
+    arguments: {
+      workspaceDir,
+      projectName: "restart-project",
+      description: "Protocol restart recovery",
+    },
+  });
+  const projectDir = created.structuredContent.workspace.projectDir;
+  const projectKey = created.structuredContent.workspace.preflightReport.projectKey;
+  const sessionId = "session-restart-1234";
+  ({ socket } = await connectFigma(first.bridgePort, projectKey, sessionId));
+  const offerId = "offer-restart-1234";
+  const offerAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
+  socket.send(JSON.stringify({
+    type: "figma.design.offer",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId,
+    sessionId,
+    figmaFileKey: "figma-file-restart",
+    rootNodeId: "90:1",
+    rootName: "Recovery",
+    rootType: "FRAME",
+    width: 1440,
+    height: 900,
+    estimatedNodeCount: 1,
+    linkedProjectKey: "",
+    linkedPageId: "",
+    createdAt: new Date().toISOString(),
+  }));
+  assert.equal((await offerAckPromise).state, "pending");
+  const acceptPromise = waitForSocketMessage(socket, "figma.design.accept");
+  await first.client.request("tools/call", {
+    name: "accept_figma_design_offer",
+    arguments: { offerId, action: "add_page", projectDir },
+  });
+  assert.equal((await acceptPromise).target.action, "add_page");
+  await new Promise((resolve) => {
+    socket.once("close", resolve);
+    socket.close();
+  });
+  socket = null;
+  await first.client.close();
+
+  const second = await startPersistentClient();
+  await second.client.request("tools/call", {
+    name: "open_design_workspace",
+    arguments: { projectDir },
+  });
+  const reconnected = await connectFigma(second.bridgePort, projectKey, sessionId);
+  socket = reconnected.socket;
+  const restored = reconnected.inbox.offers.find((offer) => offer.offerId === offerId);
+  assert.equal(restored?.state, "accepted", JSON.stringify(reconnected.inbox));
+  const payload = {
+    type: "figma.design.payload",
+    responsiveContract: responsiveContract(),
+    ...protocol16(),
+    offerId,
+    sessionId,
+    figma: {
+      fileKey: "figma-file-restart",
+      pageId: "9:1",
+      pageName: "Recovery file",
+      rootNodeId: "90:1",
+      rootNodeName: "Recovery",
+    },
+    pageSeed: {
+      node: {
+        id: "recovery-root",
+        type: "frame",
+        tag: "main",
+        name: "Recovery",
+        width: 1440,
+        height: 900,
+        opacity: 1,
+        visible: true,
+        rotation: 0,
+        style: { fill: "#202020" },
+        children: [],
+      },
+    },
+    referenceImage: solidVisualReference(1200, 750, [32, 32, 32, 255]),
+    report: {
+      nodeCount: 1,
+      resourceBytes: 0,
+      resourceCount: 0,
+      degradations: [],
+    },
+    capturedAt: new Date().toISOString(),
+  };
+  const completedPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify(payload));
+  const completed = await completedPromise;
+  assert.equal(completed.state, "completed", JSON.stringify(completed));
+  assert.equal(completed.result.entry, "recovery.html");
+  await new Promise((resolve) => {
+    socket.once("close", resolve);
+    socket.close();
+  });
+  socket = null;
+  await second.client.close();
+
+  const third = await startPersistentClient();
+  await third.client.request("tools/call", {
+    name: "open_design_workspace",
+    arguments: { projectDir },
+  });
+  const finalConnection = await connectFigma(third.bridgePort, projectKey, sessionId);
+  socket = finalConnection.socket;
+  const completedInboxOffer = finalConnection.inbox.offers.find(
+    (offer) => offer.offerId === offerId,
+  );
+  assert.equal(completedInboxOffer?.state, "completed");
+  assert.equal(
+    completedInboxOffer?.result?.transactionId,
+    completed.result.transactionId,
+  );
+  const replayPromise = waitForSocketMessage(socket, "figma.design.result");
+  socket.send(JSON.stringify({
+    type: "figma.design.result.query",
+    ...protocol16(),
+    offerId,
+    sessionId,
+  }));
+  const replay = await replayPromise;
+  assert.equal(replay.state, "completed");
+  assert.equal(replay.result.transactionId, completed.result.transactionId);
+  const manifest = JSON.parse(
+    await readFile(path.join(projectDir, ".cdb", "manifest.json"), "utf8"),
+  );
+  assert.equal(manifest.pages.filter((page) => page.entry === "recovery.html").length, 1);
 });
 
 test("imports an isolated static HTML project and opens its pages", async (t) => {
@@ -747,8 +1699,9 @@ test("ends cleanly and confirms only when Figma has unsent changes", async (t) =
   socket.send(
     JSON.stringify({
       type: "plugin.hello",
-      protocolVersion: 14,
+      ...protocol16(),
       pluginVersion: manifestVersion().split("+")[0],
+      sessionId: "reset-pending-session",
       importedAssetIds: [],
       importedPageIds: [],
       unsentChanges: true,
@@ -780,53 +1733,6 @@ test("ends cleanly and confirms only when Figma has unsent changes", async (t) =
   assert.equal(ended.structuredContent.workspace.previewUrl, "");
   assert.equal(ended.structuredContent.workspace.needsEndConfirmation, false);
   assert.equal(ended.structuredContent.workspace.summary, "本次设计已结束。");
-
-  const switchParent = path.join(projectDir, "switch-projects");
-  await mkdir(switchParent);
-  const secondCreated = await createFigmaSeedProject({
-    workspaceDir: switchParent,
-    projectName: "switch-second",
-  });
-  const thirdCreated = await createFigmaSeedProject({
-    workspaceDir: switchParent,
-    projectName: "switch-third",
-  });
-  const secondSeed = await client.request("tools/call", {
-    name: "open_design_workspace",
-    arguments: { projectDir: secondCreated.projectDir },
-  });
-  const secondWorkspace = secondSeed.structuredContent.workspace;
-  assert.equal(secondWorkspace.phase, "ready", JSON.stringify(secondWorkspace));
-
-  const pollOldWorkspace = async () => {
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 2));
-      await client.request("tools/call", {
-        name: "get_design_workspace_state",
-        arguments: { projectDir: secondWorkspace.projectDir },
-      });
-    }
-  };
-  const thirdSeedPromise = client.request("tools/call", {
-    name: "open_design_workspace",
-    arguments: { projectDir: thirdCreated.projectDir },
-  });
-  const [thirdSeed] = await Promise.all([
-    thirdSeedPromise,
-    pollOldWorkspace(),
-    pollOldWorkspace(),
-    pollOldWorkspace(),
-  ]);
-  const thirdWorkspace = thirdSeed.structuredContent.workspace;
-  assert.equal(thirdWorkspace.phase, "ready", JSON.stringify(thirdWorkspace));
-  assert.equal(thirdWorkspace.bridgeReady, true);
-  assert.doesNotMatch(thirdWorkspace.message, /另一个设计工作台/);
-
-  const bridgeHealth = await fetch(
-    `http://127.0.0.1:${bridgePort}/health`,
-  ).then((response) => response.json());
-  assert.equal(bridgeHealth.projectKey, thirdWorkspace.projectKey);
-  assert.equal(bridgeHealth.projectName, thirdWorkspace.projectName);
 });
 
 test("clears Figma links without closing the active Codex project", async (t) => {
@@ -873,8 +1779,9 @@ test("clears Figma links without closing the active Codex project", async (t) =>
   const pluginReady = waitForSocketMessage(socket, "plugin.ready");
   socket.send(JSON.stringify({
     type: "plugin.hello",
-    protocolVersion: 14,
+    ...protocol16(),
     pluginVersion: manifestVersion().split("+")[0],
+    sessionId: "workspace-reset-session",
     importedAssetIds: [],
     importedPageIds: [],
     unsentChanges: true,
@@ -908,7 +1815,7 @@ test("opens a static frontend without showing a desktop process", async (t) => {
   );
   await writeFile(
     path.join(projectDir, "index.html"),
-    '<!doctype html><title>Visible preview</title><main data-codex-root data-codex-id="preview-root"><h1 data-codex-id="preview-title">Ready</h1></main>',
+    '<!doctype html><title>Visible preview</title><main data-codex-root data-codex-id="preview-root" style="height: 2380px"><h1 data-codex-id="preview-title">Ready</h1></main>',
     "utf8",
   );
   t.after(() => rm(projectDir, { recursive: true, force: true }));
@@ -958,6 +1865,16 @@ test("opens a static frontend without showing a desktop process", async (t) => {
   );
   assert.equal(preview.structuredContent.previewImage.width, 390);
   assert.equal(preview.structuredContent.previewImage.height, 844);
+
+  const fullPreview = await client.request("tools/call", {
+    name: "get_design_preview_image",
+    arguments: { projectDir, width: 390, height: 844, fitContent: true },
+  });
+  const fullImage = fullPreview.structuredContent.previewImage;
+  assert.match(fullImage.dataUrl, /^data:image\/jpeg;base64,/);
+  assert.equal(fullImage.width, 390);
+  assert.ok(fullImage.height >= 2380, JSON.stringify({ width: fullImage.width, height: fullImage.height }));
+  assert.equal(fullPreview._meta?.previewImage, undefined);
 });
 
 test("manages and persists multiple workspace routes", async (t) => {
@@ -994,6 +1911,7 @@ test("manages and persists multiple workspace routes", async (t) => {
   assert.equal(opened.structuredContent.workspace.pages.length, 2);
   assert.equal(homePage.name, "首页");
   assert.equal(homePage.path, "/");
+  assert.equal(homePage.projectSourceHash, homePage.sourceHash);
   assert.equal(opened.structuredContent.workspace.activePageId, homePage.id);
 
   const settingsPage = opened.structuredContent.workspace.pages.find(
@@ -1025,7 +1943,8 @@ test("manages and persists multiple workspace routes", async (t) => {
   const binding = JSON.parse(
     await readFile(path.join(projectDir, ".codex", "design-bridge.json"), "utf8"),
   );
-  assert.equal(binding.version, 2);
+  assert.equal(binding.version, 3);
+  assert.equal(binding.runtimeIdentity.exactBuild, manifestVersion());
   assert.equal(binding.pages.length, 2);
   assert.equal(binding.activePageId, homePage.id);
 
@@ -1049,13 +1968,95 @@ test("manages and persists multiple workspace routes", async (t) => {
     "团队设置",
   );
 
+  const removed = await secondClient.request("tools/call", {
+    name: "manage_design_workspace_page",
+    arguments: { projectDir, action: "remove", pageId: settingsPage.id },
+  });
+  assert.equal(removed.structuredContent.workspace.pages.length, 1);
+  assert.equal(removed.structuredContent.workspace.activePageId, homePage.id);
+  assert.equal(removed.structuredContent.workspace.undoAvailable, true);
+  assert.deepEqual(removed.structuredContent.workspace.changedFiles, [
+    ".cdb/manifest.json",
+  ]);
+  assert.match(removed.structuredContent.workspace.summary, /源码文件和 Figma 画布均未删除/);
+  assert.equal(
+    JSON.parse(await readFile(path.join(projectDir, ".cdb", "manifest.json"), "utf8")).pages.length,
+    1,
+  );
+  assert.equal(await readFile(path.join(projectDir, "index.html"), "utf8").then(Boolean), true);
   await assert.rejects(
     secondClient.request("tools/call", {
       name: "manage_design_workspace_page",
-      arguments: { projectDir, action: "remove", pageId: settingsPage.id },
+      arguments: { projectDir, action: "remove", pageId: homePage.id },
     }),
-    /manifest/,
+    /至少保留一个页面/,
   );
+
+  const undone = await secondClient.request("tools/call", {
+    name: "undo_last_design_patch",
+    arguments: { projectDir },
+  });
+  assert.equal(undone.structuredContent.workspace.pages.length, 2);
+  assert.equal(undone.structuredContent.workspace.undoAvailable, false);
+  assert.equal(
+    JSON.parse(await readFile(path.join(projectDir, ".cdb", "manifest.json"), "utf8")).pages.length,
+    2,
+  );
+});
+
+test("discards a project binding from any older exact build instead of restoring it", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "design-workspace-stale-binding-"));
+  await writeFile(
+    path.join(projectDir, "index.html"),
+    '<!doctype html><main data-codex-root data-codex-id="fresh-root">Fresh</main>',
+    "utf8",
+  );
+  await writeCdbManifest(projectDir, [
+    { id: "fresh", name: "Fresh", entry: "index.html", route: "/" },
+  ]);
+  await mkdir(path.join(projectDir, ".codex"), { recursive: true });
+  await writeFile(
+    path.join(projectDir, ".codex", "design-bridge.json"),
+    JSON.stringify({
+      version: 2,
+      figmaReady: true,
+      activePageId: "fresh",
+      pages: [{
+        id: "fresh",
+        name: "Old Fresh",
+        path: "/",
+        sourceHash: "a".repeat(64),
+        syncState: "synced",
+        figmaReady: true,
+        nodeCount: 999,
+      }],
+    }),
+    "utf8",
+  );
+  const client = startClient();
+  t.after(async () => {
+    await client.close();
+    await rm(projectDir, { recursive: true, force: true });
+  });
+  await client.request("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "test", version: "1.0.0" },
+  });
+  const opened = await client.request("tools/call", {
+    name: "open_design_workspace",
+    arguments: { projectDir },
+  });
+  const state = opened.structuredContent.workspace;
+  assert.equal(state.figmaReady, false);
+  assert.equal(state.pages[0].syncState, "not_imported");
+  assert.equal(state.pages[0].nodeCount, 0);
+  const binding = JSON.parse(
+    await readFile(path.join(projectDir, ".codex", "design-bridge.json"), "utf8"),
+  );
+  assert.equal(binding.version, 3);
+  assert.equal(binding.runtimeIdentity.exactBuild, manifestVersion());
+  assert.equal(binding.figmaReady, false);
 });
 
 test("sends selected workspace routes as stable independent Figma pages", async (t) => {
@@ -1114,8 +2115,9 @@ test("sends selected workspace routes as stable independent Figma pages", async 
   socket.send(
     JSON.stringify({
       type: "plugin.hello",
-      protocolVersion: 14,
+      ...protocol16(),
       pluginVersion: manifestVersion().split("+")[0],
+      sessionId: "page-import-session",
       importedAssetIds: [],
       importedPageIds: [],
     }),
@@ -1130,7 +2132,12 @@ test("sends selected workspace routes as stable independent Figma pages", async 
       pageIds: [homePage.id, settingsPage.id],
     },
   });
-  const firstUpsert = await firstUpsertPromise;
+  const firstUpsert = await Promise.race([
+    firstUpsertPromise,
+    sendAllPromise.then((result) => {
+      throw new Error(`send_preview_to_local_figma completed before emitting page.upsert: ${JSON.stringify(result)}`);
+    }),
+  ]);
   socket.send(
     JSON.stringify({
       type: "page.import.result",
@@ -1172,6 +2179,16 @@ test("sends selected workspace routes as stable independent Figma pages", async 
   );
   const resent = await sendOnePromise;
   assert.match(resent.structuredContent.workspace.summary, /已发送 1 个页面/);
+  assert.ok(
+    resent.structuredContent.workspace.pages.every(
+      (page) => page.figmaReady && page.syncState === "synced",
+    ),
+  );
+  assert.ok(
+    resent.structuredContent.workspace.pages.every(
+      (page) => page.projectSourceHash && page.projectSourceHash !== page.sourceHash,
+    ),
+  );
 });
 
 test("reports unsupported Figma changes as pending for a Codex handoff", async (t) => {
@@ -1218,18 +2235,16 @@ test("reports unsupported Figma changes as pending for a Codex handoff", async (
   socket.send(
     JSON.stringify({
       type: "plugin.hello",
-      protocolVersion: 14,
+      ...protocol16(),
       pluginVersion: manifestVersion().split("+")[0],
+      sessionId: "page-change-session",
       importedAssetIds: [],
       importedPageIds: [],
     }),
   );
   await readyPromise;
 
-  const firstMessagePromise = waitForAnySocketMessage(socket, [
-    "page.changes.ack",
-    "bridge.error",
-  ]);
+  const ackPromise = waitForSocketMessage(socket, "page.changes.ack");
   socket.send(
     JSON.stringify({
       type: "page.changes.record",
@@ -1255,8 +2270,7 @@ test("reports unsupported Figma changes as pending for a Codex handoff", async (
       },
     }),
   );
-  const ack = await firstMessagePromise;
-  assert.notEqual(ack.type, "bridge.error", ack.error);
+  const ack = await ackPromise;
   assert.equal(ack.state, "pending");
 
   let state;
@@ -1269,12 +2283,12 @@ test("reports unsupported Figma changes as pending for a Codex handoff", async (
     if (state.pendingChangeCount === 1) break;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  assert.equal(state.phase, "in_figma");
+  assert.equal(state.phase, "applying");
   assert.equal(state.changeCount, 1);
   assert.equal(state.appliedChangeCount, 0);
   assert.equal(state.pendingChangeCount, 1);
   assert.match(state.designSnapshotPath, /workspace-changes/);
-  assert.match(state.summary, /等待 Codex 应用/);
+  assert.match(state.summary, /Codex 正在处理/);
   assert.doesNotMatch(state.summary, /已应用 1 处/);
 
   const binding = JSON.parse(
@@ -1284,7 +2298,7 @@ test("reports unsupported Figma changes as pending for a Codex handoff", async (
   assert.equal(binding.designSnapshotPath, state.designSnapshotPath);
 });
 
-test("verifies a protocol 14 reparent in the real preview before clearing pending", async (t) => {
+test("verifies a protocol 16 reparent in the real preview before clearing pending", async (t) => {
   const projectDir = await mkdtemp(
     path.join(os.tmpdir(), "design-workspace-reparent-verify-"),
   );
@@ -1350,22 +2364,24 @@ test("verifies a protocol 14 reparent in the real preview before clearing pendin
   const readyPromise = waitForSocketMessage(socket, "plugin.ready");
   socket.send(JSON.stringify({
     type: "plugin.hello",
-    protocolVersion: 14,
+    ...protocol16(),
     pluginVersion: manifestVersion().split("+")[0],
+    sessionId: "page-reparent-session",
     importedAssetIds: [],
     importedPageIds: [],
   }));
   await readyPromise;
 
-  const verifiedMessagePromise = waitForSocketMessage(socket, "page.changes.ack");
+  const ackPromise = waitForSocketMessage(socket, "page.changes.ack");
   socket.send(JSON.stringify({
     type: "page.changes.record",
     requestId: "verified-reparent",
     changeSet: {
-      protocolVersion: 14,
+      ...protocol16(),
       changeSetId: "verified-reparent",
       pageId: page.id,
       sourceHash: page.sourceHash,
+      referenceImage: solidVisualReference(800, 600),
       changes: [{
         nodeId: "daodao",
         nodeType: "FRAME",
@@ -1388,11 +2404,11 @@ test("verifies a protocol 14 reparent in the real preview before clearing pendin
       annotations: [],
     },
   }));
-  const ack = await verifiedMessagePromise;
+  const ack = await ackPromise;
   assert.equal(ack.state, "applied");
-  assert.notEqual(ack.sourceHash, page.sourceHash);
   assert.equal(ack.fastApply.pendingCount, 0);
   assert.equal(ack.fastApply.verification.status, "passed");
+  assert.equal(ack.fastApply.verification.visual.status, "passed");
   assert.equal(ack.fastApply.verification.checkedNodes, 1);
   assert.ok(ack.fastApply.verification.maxPositionErrorPx <= 2);
   const source = await readFile(path.join(projectDir, "index.html"), "utf8");
@@ -1406,7 +2422,7 @@ test("verifies a protocol 14 reparent in the real preview before clearing pendin
     type: "page.changes.record",
     requestId: "failed-verification-reparent",
     changeSet: {
-      protocolVersion: 14,
+      ...protocol16(),
       changeSetId: "failed-verification-reparent",
       pageId: page.id,
       sourceHash: ack.sourceHash,
@@ -1439,6 +2455,78 @@ test("verifies a protocol 14 reparent in the real preview before clearing pendin
   assert.equal(failedAck.fastApply.verification.status, "failed");
   assert.equal(failedAck.fastApply.verification.rollback.status, "passed");
   assert.deepEqual(failedAck.fastApply.changedFiles, []);
+  assert.equal(
+    await readFile(path.join(projectDir, "index.html"), "utf8"),
+    source,
+  );
+
+  const visualFailurePromise = waitForSocketMessage(socket, "page.changes.ack");
+  socket.send(JSON.stringify({
+    type: "page.changes.record",
+    requestId: "failed-visual-verification",
+    changeSet: {
+      ...protocol16(),
+      changeSetId: "failed-visual-verification",
+      pageId: page.id,
+      sourceHash: ack.sourceHash,
+      referenceImage: solidVisualReference(800, 600, [0, 0, 0, 255]),
+      changes: [{
+        nodeId: "daodao",
+        figmaNodeId: "123:4",
+        nodeType: "FRAME",
+        category: "visual",
+        property: "opacity",
+        sourceRef: { selector: '[data-codex-id="daodao"]' },
+        from: 1,
+        to: 0.5,
+      }],
+      annotations: [],
+    },
+  }));
+  const visualFailure = await visualFailurePromise;
+  assert.equal(visualFailure.state, "pending");
+  assert.equal(visualFailure.fastApply.verification.status, "failed");
+  assert.equal(visualFailure.fastApply.verification.code, "visual_verification_failed");
+  assert.equal(visualFailure.fastApply.verification.visual.status, "failed");
+  assert.equal(visualFailure.fastApply.verification.differences[0].nodeId, "daodao");
+  assert.equal(visualFailure.fastApply.verification.differences[0].property, "opacity");
+  assert.equal(visualFailure.fastApply.verification.differences[0].figmaNodeId, "123:4");
+  assert.equal(visualFailure.fastApply.verification.differences[0].sourceRef.selector, '[data-codex-id="daodao"]');
+  assert.deepEqual(
+    visualFailure.fastApply.verification.differences[0].actualBounds,
+    { x: 50, y: 60, width: 180, height: 52 },
+  );
+  assert.equal(visualFailure.fastApply.verification.rollback.status, "passed");
+  const verificationImages = await client.request("tools/call", {
+    name: "get_design_verification_images",
+    arguments: { projectDir, pageId: page.id },
+  });
+  const comparison = verificationImages.structuredContent.verificationImages;
+  assert.match(comparison.reference.dataUrl, /^data:image\/png;base64,/);
+  assert.match(comparison.actual.dataUrl, /^data:image\/png;base64,/);
+  assert.equal(comparison.reference.width, 800);
+  assert.equal(comparison.reference.height, 600);
+  assert.equal(comparison.thresholds.channelThreshold, 32);
+  const sourceLocationResult = await client.request("tools/call", {
+    name: "get_design_source_location",
+    arguments: { projectDir, pageId: page.id, nodeId: "daodao" },
+  });
+  const sourceLocation = sourceLocationResult.structuredContent.sourceLocation;
+  assert.equal(sourceLocation.file, "index.html");
+  assert.ok(sourceLocation.line > 0);
+  assert.equal(sourceLocation.selector, '[data-codex-id="daodao"]');
+  assert.match(sourceLocation.snippet, /data-codex-id="daodao"/);
+  const focusMessagePromise = waitForSocketMessage(socket, "page.node.locate");
+  const focusResult = await client.request("tools/call", {
+    name: "focus_figma_design_node",
+    arguments: { projectDir, pageId: page.id, nodeId: "daodao" },
+  });
+  assert.equal(focusResult.structuredContent.figmaFocus.figmaNodeId, "123:4");
+  assert.deepEqual(await focusMessagePromise, {
+    type: "page.node.locate",
+    pageId: page.id,
+    figmaNodeId: "123:4",
+  });
   assert.equal(
     await readFile(path.join(projectDir, "index.html"), "utf8"),
     source,
@@ -1689,6 +2777,27 @@ function manifestVersion() {
   ).version;
 }
 
+function protocol16() {
+  return {
+    protocolVersion: 16,
+    runtimeIdentity: {
+      kind: "cdb-0.9-responsive-v2",
+      protocolVersion: 16,
+      pageIrSchemaVersion: 2,
+      exactBuild: manifestVersion(),
+    },
+  };
+}
+
+function responsiveContract(width = 1440, height = 900) {
+  return {
+    designViewport: { width, height },
+    runtimeViewports: [{ id: `runtime-${width}`, width, height, devicePixelRatio: 1 }],
+    previewScale: { mode: "one-to-one", value: 1, breakpointId: null },
+    breakpoints: [],
+  };
+}
+
 function expectedRuntimeSource() {
   const normalized = pluginRoot.replaceAll("\\", "/").toLowerCase();
   if (normalized.includes("/.codex/plugins/cache/")) return "personal-cache";
@@ -1699,28 +2808,28 @@ function expectedRuntimeSource() {
 }
 
 function startClient(environment = {}) {
-  const automaticRegistryPath = environment.CODEX_DESIGN_BRIDGE_PROJECT_REGISTRY
-    ? ""
-    : path.join(
-        os.tmpdir(),
-        `cdb-project-registry-test-${process.pid}-${++clientRegistrySequence}.json`,
-      );
+  const temporaryLease = environment.CODEX_DESIGN_BRIDGE_LEASE_ROOT
+    ? null
+    : mkdtempSync(path.join(os.tmpdir(), "cdb-mcp-test-lease-"));
   const child = spawn(process.execPath, [serverPath], {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
     env: {
       ...process.env,
       CODEX_DESIGN_BRIDGE_PORT: "0",
-      ...(automaticRegistryPath
-        ? { CODEX_DESIGN_BRIDGE_PROJECT_REGISTRY: automaticRegistryPath }
-        : {}),
+      CODEX_DESIGN_BRIDGE_LEASE_ROOT: temporaryLease || environment.CODEX_DESIGN_BRIDGE_LEASE_ROOT,
       ...environment,
     },
   });
   let id = 0;
   let stdout = "";
+  let stderr = "";
   const pending = new Map();
 
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr = (stderr + chunk).slice(-4000);
+  });
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
@@ -1745,7 +2854,7 @@ function startClient(environment = {}) {
   });
   child.once("exit", (code, signal) => {
     const error = new Error(
-      `Design workspace server exited before replying (code ${code}, signal ${signal}).`,
+      `Design workspace server exited before replying (code ${code}, signal ${signal}).\n${stderr}`,
     );
     for (const request of pending.values()) request.reject(error);
     pending.clear();
@@ -1761,15 +2870,14 @@ function startClient(environment = {}) {
         );
       });
     },
-    close() {
-      const cleanup = () => automaticRegistryPath
-        ? unlink(automaticRegistryPath).catch(() => {})
-        : Promise.resolve();
-      if (child.exitCode !== null) return cleanup();
-      return new Promise((resolve) => {
-        child.once("exit", () => cleanup().then(resolve));
-        child.stdin.end();
-      });
+    async close() {
+      if (child.exitCode === null) {
+        await new Promise((resolve) => {
+          child.once("exit", resolve);
+          child.stdin.end();
+        });
+      }
+      if (temporaryLease) await rm(temporaryLease, { recursive: true, force: true });
     },
   };
 }
@@ -1786,7 +2894,7 @@ async function getFreePort() {
   return port;
 }
 
-function waitForSocketMessage(socket, type, timeoutMs = 20_000) {
+function waitForSocketMessage(socket, type, timeoutMs = 15_000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`Timed out waiting for ${type}.`)),
@@ -1794,30 +2902,7 @@ function waitForSocketMessage(socket, type, timeoutMs = 20_000) {
     );
     const onMessage = (raw) => {
       const message = JSON.parse(String(raw));
-      if (type !== "bridge.error" && message.type === "bridge.error") {
-        clearTimeout(timer);
-        socket.off("message", onMessage);
-        reject(new Error(message.error || "Figma bridge error."));
-        return;
-      }
       if (message.type !== type) return;
-      clearTimeout(timer);
-      socket.off("message", onMessage);
-      resolve(message);
-    };
-    socket.on("message", onMessage);
-  });
-}
-
-function waitForAnySocketMessage(socket, types, timeoutMs = 20_000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Timed out waiting for ${types.join(" or ")}.`)),
-      timeoutMs,
-    );
-    const onMessage = (raw) => {
-      const message = JSON.parse(String(raw));
-      if (!types.includes(message.type)) return;
       clearTimeout(timer);
       socket.off("message", onMessage);
       resolve(message);

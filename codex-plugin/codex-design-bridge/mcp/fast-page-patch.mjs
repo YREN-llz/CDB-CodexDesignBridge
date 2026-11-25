@@ -1,14 +1,14 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import {
+  CDB_BRIDGE_PROTOCOL_VERSION,
+  validateExactRuntimeIdentity,
+} from "../shared/runtime-contract.mjs";
 import { prepareSvgAsset } from "../shared/svg.mjs";
 import {
   commitPatchTransaction,
   hashContent,
 } from "./patch-transaction.mjs";
-import {
-  assessStalePageChange,
-  collectCreatedPageNodeIds,
-} from "./page-change-compare.mjs";
 
 const MARKER_START = "/* Codex Design Bridge overrides: start */";
 const MARKER_END = "/* Codex Design Bridge overrides: end */";
@@ -34,9 +34,7 @@ const IGNORED_DIRECTORIES = new Set([
   "node_modules",
 ]);
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
-const MAX_INSERTED_PAGE_NODES = 200;
-const MAX_PAGE_SEED_NODES = 2000;
-const CHANGESET_PROTOCOL_VERSION = 14;
+const CHANGESET_PROTOCOL_VERSION = CDB_BRIDGE_PROTOCOL_VERSION;
 const VECTOR_NODE_TYPES = new Set([
   "BOOLEAN_OPERATION",
   "ELLIPSE",
@@ -73,75 +71,29 @@ export async function applyFastPageChanges({
   projectDir,
   changeSet,
   manifest,
-  baselineManifest = undefined,
-  baselineSourceHash = "",
-  currentManifest = null,
-  currentSourceHash = "",
 }) {
   const startedAt = Date.now();
   const root = path.resolve(projectDir);
   const changes = Array.isArray(changeSet?.changes) ? changeSet.changes : [];
   const pending = [];
 
-  if (
-    changeSet?.protocolVersion !== undefined &&
-    ![13, CHANGESET_PROTOCOL_VERSION].includes(changeSet.protocolVersion)
-  ) {
+  if (changeSet?.protocolVersion !== CHANGESET_PROTOCOL_VERSION) {
     return pendingResult(changes, "unsupported_change_protocol", startedAt);
+  }
+  try {
+    validateExactRuntimeIdentity(changeSet.runtimeIdentity);
+  } catch {
+    return pendingResult(changes, "runtime_identity_mismatch", startedAt);
   }
 
   if (!manifest || manifest.pageId !== changeSet?.pageId) {
     return pendingResult(changes, "missing_page_mapping", startedAt);
   }
-  if (typeof changeSet.sourceHash !== "string") {
+  if (
+    typeof changeSet.sourceHash !== "string" ||
+    changeSet.sourceHash !== manifest.sourceHash
+  ) {
     return pendingResult(changes, "stale_page_mapping", startedAt);
-  }
-  const hasSourceContext =
-    Boolean(baselineSourceHash || currentSourceHash || currentManifest);
-  const mappedBaseline =
-    baselineManifest?.pageId === changeSet.pageId &&
-    baselineManifest.sourceHash === changeSet.sourceHash;
-  if (!hasSourceContext && changeSet.sourceHash !== manifest.sourceHash) {
-    return pendingResult(changes, "stale_page_mapping", startedAt);
-  }
-  const exactCurrentSource =
-    Boolean(currentSourceHash) && changeSet.sourceHash === currentSourceHash;
-  const requiresNodeRebase = hasSourceContext && !exactCurrentSource && (
-    mappedBaseline
-      ? !baselineSourceHash ||
-        !currentSourceHash ||
-        baselineSourceHash !== currentSourceHash
-      : changeSet.sourceHash !== manifest.sourceHash
-  );
-  if (requiresNodeRebase && !currentManifest?.root) {
-    return pendingResult(changes, "stale_page_mapping", startedAt);
-  }
-  const createdNodeIds = collectCreatedPageNodeIds(changes);
-  if (requiresNodeRebase) {
-    const assessments = changes.map((change) => ({
-      change,
-      assessment: assessStalePageChange({
-        change,
-        baselineManifest: mappedBaseline ? baselineManifest : null,
-        currentManifest,
-        createdNodeIds,
-      }),
-    }));
-    const conflict = assessments.find((entry) => !entry.assessment.ok);
-    if (conflict) {
-      return {
-        ...pendingResult(changes, "stale_change_set_conflict", startedAt),
-        pending: assessments.map(({ change, assessment }) =>
-          pendingChange(
-            change,
-            assessment.ok
-              ? "dependent_stale_change_conflict"
-              : assessment.reason,
-            "conflict",
-          ),
-        ),
-      };
-    }
   }
 
   const files = await listProjectFiles(root);
@@ -163,12 +115,12 @@ export async function applyFastPageChanges({
       changeSet?.protocolVersion === CHANGESET_PROTOCOL_VERSION &&
       ["nodeMove", "nodeReparent"].includes(change?.property)
     ) {
-      const protocolError = validateProtocol14StructureChange(change);
+      const protocolError = validateCurrentStructureChange(change);
       if (protocolError) {
         pending.push(
           pendingChange(
             change,
-            `invalid_protocol14_structure:${protocolError}`,
+            `invalid_protocol16_structure:${protocolError}`,
             "protocol",
           ),
         );
@@ -203,7 +155,6 @@ export async function applyFastPageChanges({
       const rendered = renderInsertedPageNode(
         change?.to?.node,
         path.extname(sourceFile).toLowerCase(),
-        MAX_PAGE_SEED_NODES,
       );
       if (!rendered.ok) {
         pending.push(pendingChange(change, rendered.reason));
@@ -745,7 +696,7 @@ function pendingResult(changes, reason, startedAt) {
   };
 }
 
-function validateProtocol14StructureChange(change) {
+function validateCurrentStructureChange(change) {
   const requiredStrings = [
     "nodeId",
     "fromParentId",
@@ -1149,7 +1100,7 @@ function cssFontDeclarations(value) {
   return [
     {
       property: "font-family",
-      value: `"${value.family.trim().replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`,
+      value: `"${value.family.trim().replaceAll("\\", "\\\\").replaceAll('"', '\\"')}", ui-sans-serif, system-ui, sans-serif`,
     },
     { property: "font-weight", value: String(weight) },
     {
@@ -1218,8 +1169,33 @@ function numericDeclaration(property, value) {
     : null;
 }
 
+function isSingleLineTextDefinition(definition) {
+  if (
+    !definition ||
+    definition.type !== "text" ||
+    !Number.isFinite(definition.height) ||
+    !Number.isFinite(definition.fontSize) ||
+    String(definition.text || "").includes("\n")
+  ) {
+    return false;
+  }
+  const lineHeight = definition.lineHeight;
+  const resolvedLineHeight =
+    lineHeight?.unit === "PIXELS" && Number.isFinite(lineHeight.value)
+      ? lineHeight.value
+      : lineHeight?.unit === "PERCENT" && Number.isFinite(lineHeight.value)
+        ? definition.fontSize * lineHeight.value / 100
+        : lineHeight?.unit === "AUTO"
+          ? definition.fontSize * 1.2
+          : null;
+  return Number.isFinite(resolvedLineHeight) && definition.height <= resolvedLineHeight + 1;
+}
+
 function cssColor(value) {
   if (value === null) return "transparent";
+  if (typeof value === "string" && /^#[0-9A-F]{6}(?:[0-9A-F]{2})?$/i.test(value)) {
+    return value.toUpperCase();
+  }
   if (
     !value ||
     typeof value !== "object" ||
@@ -1490,10 +1466,69 @@ function cloneMappedElement(source, selector, payload) {
   };
 }
 
+export function renderStandalonePageSeed(
+  definition,
+  {
+    title = "Figma Design",
+    assetBasePath = "./assets",
+    stylesheetHref = "./styles.css",
+  } = {},
+) {
+  const rendered = renderInsertedPageNode(definition, ".html", {
+    maxNodes: 500,
+    assetBasePath,
+    preserveComputedSize: true,
+  });
+  if (!rendered.ok) {
+    throw Object.assign(new Error(`Figma 页面无法生成：${rendered.reason}`), {
+      code: rendered.reason,
+    });
+  }
+  const assetsByHash = new Map();
+  let markup = rendered.markup;
+  for (const asset of rendered.assets) {
+    const digest = hashContent(asset.bytes);
+    const fileName = `${digest.slice(0, 32)}.png`;
+    markup = markup.replaceAll(
+      `${assetBasePath}/${asset.fileName}`,
+      `${assetBasePath}/${fileName}`,
+    );
+    if (!assetsByHash.has(digest)) {
+      assetsByHash.set(digest, { fileName, bytes: asset.bytes, sha256: digest });
+    }
+  }
+  return {
+    html: [
+      "<!doctype html>",
+      '<html lang="zh-CN">',
+      "<head>",
+      '  <meta charset="utf-8">',
+      '  <meta name="viewport" content="width=device-width, initial-scale=1">',
+      `  <title>${escapeMarkupText(title)}</title>`,
+      `  <link rel="stylesheet" href="${escapeMarkupAttribute(stylesheetHref)}">`,
+      "</head>",
+      "<body>",
+      indentMarkup(markup.replace(/^<([A-Za-z][\w:-]*)\b/, '<$1 data-codex-root'), "  ", "\n"),
+      "</body>",
+      "</html>",
+      "",
+    ].join("\n"),
+    css: renderStandaloneRules(rendered.rules, {
+      backgroundColor: definition?.style?.fill,
+    }),
+    assets: [...assetsByHash.values()],
+    nodeCount: rendered.nodeCount,
+  };
+}
+
 function renderInsertedPageNode(
   definition,
   extension,
-  maxNodes = MAX_INSERTED_PAGE_NODES,
+  {
+    maxNodes = 200,
+    assetBasePath = "/codex-design-assets",
+    preserveComputedSize = false,
+  } = {},
 ) {
   const state = {
     ids: new Set(),
@@ -1502,6 +1537,8 @@ function renderInsertedPageNode(
     assets: [],
     extension,
     maxNodes,
+    assetBasePath,
+    preserveComputedSize,
   };
   try {
     const markup = renderInsertedPageNodeDefinition(definition, state);
@@ -1511,6 +1548,7 @@ function renderInsertedPageNode(
       markup,
       rules: state.rules,
       assets: state.assets,
+      nodeCount: state.count,
     };
   } catch (error) {
     return {
@@ -1552,7 +1590,9 @@ function renderInsertedPageNodeDefinition(definition, state) {
   if (!tag) {
     throw new InsertedNodeError("invalid_inserted_node_tag");
   }
-  const declarations = insertedNodeDeclarations(definition);
+  const declarations = insertedNodeDeclarations(definition, {
+    preserveComputedSize: state.preserveComputedSize,
+  });
   if (!declarations) {
     throw new InsertedNodeError("invalid_inserted_node_style");
   }
@@ -1560,7 +1600,7 @@ function renderInsertedPageNodeDefinition(definition, state) {
     selector: `[data-codex-id="${nodeId}"]`,
     declarations,
   });
-  const attribute = `data-codex-id="${escapeMarkupAttribute(nodeId)}"`;
+  const attribute = insertedNodeAttributes(definition, nodeId);
   if (definition.type === "text") {
     if (typeof definition.text !== "string" || definition.text.length > 20_000) {
       throw new InsertedNodeError("invalid_inserted_text");
@@ -1578,7 +1618,7 @@ function renderInsertedPageNodeDefinition(definition, state) {
     const closing = [".jsx", ".tsx", ".js", ".ts"].includes(state.extension)
       ? " />"
       : ">";
-    return `<img ${attribute} src="/codex-design-assets/${fileName}" alt="${alt}"${closing}`;
+    return `<img ${attribute} src="${state.assetBasePath}/${fileName}" alt="${alt}"${closing}`;
   }
   if (definition.type === "svg") {
     const decoded = decodeSvgPayload(definition.svg);
@@ -1589,18 +1629,19 @@ function renderInsertedPageNodeDefinition(definition, state) {
     if (!exported) {
       throw new InsertedNodeError("invalid_svg_markup");
     }
-    let opening = exported.opening;
-    for (const name of ["data-codex-id", "aria-label", "style"]) {
-      opening = removeMarkupAttribute(opening, name);
+    let opening = removeMarkupAttribute(exported.opening, "style");
+    for (const match of attribute.matchAll(/([a-z][a-z0-9-]*)="([^"]*)"/gi)) {
+      opening = upsertMarkupAttribute(opening, match[1], match[2]);
     }
-    opening = opening.replace(
-      /\s*\/?>$/,
-      ` ${attribute} aria-label="${escapeMarkupAttribute(definition.name || "Figma vector")}">`,
+    opening = upsertMarkupAttribute(
+      opening,
+      "aria-label",
+      escapeMarkupAttribute(definition.name || "Figma vector"),
     );
     return `${opening}${exported.inner}</svg>`;
   }
   const children = Array.isArray(definition.children) ? definition.children : [];
-  if (children.length > state.maxNodes) {
+  if (children.length > 200) {
     throw new InsertedNodeError("invalid_inserted_node");
   }
   const typeAttribute = tag === "button" ? ' type="button"' : "";
@@ -1616,6 +1657,46 @@ function renderInsertedPageNodeDefinition(definition, state) {
     ...renderedChildren.map((child) => indentMarkup(child, childIndent, "\n")),
     `</${tag}>`,
   ].join("\n");
+}
+
+function insertedNodeAttributes(definition, nodeId) {
+  const attributes = [
+    `data-codex-id="${escapeMarkupAttribute(nodeId)}"`,
+    'data-codex-fixed-size="true"',
+  ];
+  const constraints = definition?.responsive?.constraints || definition?.constraints;
+  if (constraints && typeof constraints === "object") {
+    const horizontal = String(constraints.horizontal || "").toUpperCase();
+    const vertical = String(constraints.vertical || "").toUpperCase();
+    const allowed = new Set(["MIN", "CENTER", "MAX", "STRETCH", "SCALE"]);
+    if (!allowed.has(horizontal) || !allowed.has(vertical)) {
+      throw new InsertedNodeError("invalid_inserted_node_constraints");
+    }
+    attributes.push(`data-codex-constraint-horizontal="${horizontal}"`);
+    attributes.push(`data-codex-constraint-vertical="${vertical}"`);
+  }
+  if (definition.type === "frame" && definition.layout?.kind === "grid") {
+    const columns = definition.layout.grid?.columns;
+    const rows = definition.layout.grid?.rows;
+    if (!safeCssLayoutValue(columns) || !safeCssLayoutValue(rows)) {
+      throw new InsertedNodeError("invalid_inserted_node_grid");
+    }
+    attributes.push(`data-codex-grid-columns="${escapeMarkupAttribute(columns)}"`);
+    attributes.push(`data-codex-grid-rows="${escapeMarkupAttribute(rows)}"`);
+  }
+  if (definition.type === "text") {
+    for (const [attribute, value] of [
+      ["data-codex-line-height-unit", definition.lineHeight?.unit],
+      ["data-codex-line-height-value", definition.lineHeight?.value],
+      ["data-codex-letter-spacing-unit", definition.letterSpacing?.unit],
+      ["data-codex-letter-spacing-value", definition.letterSpacing?.value],
+    ]) {
+      if (value !== undefined && value !== null && String(value) !== "") {
+        attributes.push(`${attribute}="${escapeMarkupAttribute(String(value))}"`);
+      }
+    }
+  }
+  return attributes.join(" ");
 }
 
 function validateInsertedTag(type, value) {
@@ -1642,7 +1723,10 @@ function validateInsertedTag(type, value) {
   return allowed.has(tag) ? tag : "";
 }
 
-function insertedNodeDeclarations(definition) {
+function insertedNodeDeclarations(
+  definition,
+  { preserveComputedSize = false } = {},
+) {
   const width = numericDeclaration("width", definition.width);
   const height = numericDeclaration("height", definition.height);
   if (!width || !height) return null;
@@ -1651,6 +1735,24 @@ function insertedNodeDeclarations(definition) {
     height,
     { property: "box-sizing", value: "border-box" },
   ];
+  const responsive = definition?.responsive && typeof definition.responsive === "object"
+    ? definition.responsive
+    : definition;
+  if (responsive.minWidth != null) {
+    const minWidth = numericDeclaration("min-width", responsive.minWidth);
+    if (!minWidth) return null;
+    declarations.push(minWidth);
+  }
+  if (responsive.maxWidth != null) {
+    const maxWidth = numericDeclaration("max-width", responsive.maxWidth);
+    if (!maxWidth) return null;
+    declarations.push(maxWidth);
+  }
+  if (definition.type === "image") {
+    const objectFit = responsive.objectFit || definition.objectFit || "cover";
+    if (!["fill", "contain", "cover", "none", "scale-down"].includes(objectFit)) return null;
+    declarations.push({ property: "object-fit", value: objectFit });
+  }
   const layoutItem = definition.layoutItem || null;
   if (layoutItem) {
     if (Number.isInteger(layoutItem.order)) {
@@ -1681,17 +1783,23 @@ function insertedNodeDeclarations(definition) {
       declarations.push({ property: "align-self", value: "stretch" });
     }
     if (layoutItem.positioning === "absolute") {
-      declarations.push({ property: "position", value: "absolute" });
+      declarations.push(
+        { property: "position", value: "absolute" },
+        { property: "left", value: `${formatNumber(Number(definition.x) || 0)}px` },
+        { property: "top", value: `${formatNumber(Number(definition.y) || 0)}px` },
+      );
     }
-    if (layoutItem.horizontalSizing === "fill") {
-      declarations.push({ property: "width", value: "100%" });
-    } else if (layoutItem.horizontalSizing === "hug") {
-      declarations.push({ property: "width", value: "fit-content" });
-    }
-    if (layoutItem.verticalSizing === "fill") {
-      declarations.push({ property: "height", value: "100%" });
-    } else if (layoutItem.verticalSizing === "hug") {
-      declarations.push({ property: "height", value: "fit-content" });
+    if (!preserveComputedSize) {
+      if (layoutItem.horizontalSizing === "fill") {
+        declarations.push({ property: "width", value: "100%" });
+      } else if (layoutItem.horizontalSizing === "hug") {
+        declarations.push({ property: "width", value: "fit-content" });
+      }
+      if (layoutItem.verticalSizing === "fill") {
+        declarations.push({ property: "height", value: "100%" });
+      } else if (layoutItem.verticalSizing === "hug") {
+        declarations.push({ property: "height", value: "fit-content" });
+      }
     }
   }
   if (
@@ -1721,7 +1829,7 @@ function insertedNodeDeclarations(definition) {
   const fill = definition?.style?.fill
     ? cssColor(definition.style.fill)
     : null;
-  if (fill !== null) {
+  if (fill !== null && ["frame", "text"].includes(definition.type)) {
     declarations.push({
       property: definition.type === "text" ? "color" : "background-color",
       value: fill,
@@ -1739,37 +1847,41 @@ function insertedNodeDeclarations(definition) {
       value: `${formatNumber(Math.max(0, strokeWeight))}px solid ${stroke}`,
     });
   }
-  const radius = cssRadius(definition?.style?.cornerRadius);
+  const radius = cssRadius(
+    definition?.style?.cornerRadius ?? definition?.style?.radius,
+  );
   if (radius !== null && definition.type === "frame") {
     declarations.push({ property: "border-radius", value: radius });
   }
   if (definition.type === "frame") {
-    const layout = definition.layout || {};
-    // CDB 0.7.0 initially serialized Figma GROUP and some instance sublayers
-    // as { kind: "flex", mode: null }. A missing Figma layoutMode means a
-    // normal non-auto-layout container, and treating only null/undefined as
-    // NONE is safe. Unknown non-null values remain rejected below.
-    const layoutMode = layout.mode == null ? "NONE" : layout.mode;
+    if (definition.clipsContent === true) {
+      declarations.push({ property: "overflow", value: "hidden" });
+    }
+    // Figma rectangles and groups are represented as frame-like HTML nodes but
+    // do not carry Auto Layout metadata. Their implicit layout is NONE.
+    const layout = definition.layout || { kind: "none", mode: "NONE" };
     if (layout.kind === "grid") {
       declarations.push(
         { property: "display", value: "grid" },
         { property: "grid-template-columns", value: safeCssLayoutValue(layout.grid?.columns) ? layout.grid.columns : "none" },
         { property: "grid-template-rows", value: safeCssLayoutValue(layout.grid?.rows) ? layout.grid.rows : "none" },
       );
-    } else if (layoutMode === "HORIZONTAL" || layoutMode === "VERTICAL") {
+    } else if (layout.mode === "HORIZONTAL" || layout.mode === "VERTICAL") {
       declarations.push(
         { property: "display", value: "flex" },
         {
           property: "flex-direction",
-          value: layoutMode === "HORIZONTAL" ? "row" : "column",
+          value: layout.mode === "HORIZONTAL" ? "row" : "column",
         },
       );
       declarations.push({
         property: "flex-wrap",
         value: layout.wrap ? "wrap" : "nowrap",
       });
-    } else if (layoutMode !== "NONE") {
+    } else if (layout.mode !== "NONE") {
       return null;
+    } else {
+      declarations.push({ property: "position", value: "relative" });
     }
     if (Number.isFinite(layout.itemSpacing) && layout.itemSpacing >= 0) {
       declarations.push({
@@ -1780,10 +1892,10 @@ function insertedNodeDeclarations(definition) {
     if (
       Number.isFinite(layout.counterAxisSpacing) &&
       layout.counterAxisSpacing >= 0 &&
-      layoutMode !== "NONE"
+      layout.mode !== "NONE"
     ) {
       declarations.push({
-        property: layoutMode === "HORIZONTAL" ? "row-gap" : "column-gap",
+        property: layout.mode === "HORIZONTAL" ? "row-gap" : "column-gap",
         value: `${formatNumber(layout.counterAxisSpacing)}px`,
       });
     }
@@ -1805,12 +1917,20 @@ function insertedNodeDeclarations(definition) {
     }[layout.counterAxisAlignItems];
     if (justify) declarations.push({ property: "justify-content", value: justify });
     if (align) declarations.push({ property: "align-items", value: align });
-    const primaryProperty = layoutMode === "HORIZONTAL" ? "width" : "height";
-    const counterProperty = layoutMode === "HORIZONTAL" ? "height" : "width";
-    if (layout.primaryAxisSizingMode === "AUTO") {
+    const primaryProperty = layout.mode === "HORIZONTAL" ? "width" : "height";
+    const counterProperty = layout.mode === "HORIZONTAL" ? "height" : "width";
+    if (
+      !preserveComputedSize &&
+      layout.mode !== "NONE" &&
+      layout.primaryAxisSizingMode === "AUTO"
+    ) {
       declarations.push({ property: primaryProperty, value: "fit-content" });
     }
-    if (layout.counterAxisSizingMode === "AUTO") {
+    if (
+      !preserveComputedSize &&
+      layout.mode !== "NONE" &&
+      layout.counterAxisSizingMode === "AUTO"
+    ) {
       declarations.push({ property: counterProperty, value: "fit-content" });
     }
   }
@@ -1823,7 +1943,36 @@ function insertedNodeDeclarations(definition) {
       definition.letterSpacing,
     );
     if (!font || !fontSize || !lineHeight || !letterSpacing) return null;
-    declarations.push(...font, fontSize, lineHeight, letterSpacing);
+    declarations.push(
+      ...font,
+      fontSize,
+      lineHeight,
+      letterSpacing,
+      { property: "white-space", value: "pre-wrap" },
+    );
+    const singleLine =
+      definition.maxLines === 1 || isSingleLineTextDefinition(definition);
+    if (singleLine) {
+      declarations.push({ property: "white-space", value: "nowrap" });
+    }
+    if (definition.textTruncation === "ENDING") {
+      const maxLines = Number.isInteger(definition.maxLines)
+        ? definition.maxLines
+        : 1;
+      declarations.push(
+        { property: "overflow", value: "hidden" },
+        { property: "text-overflow", value: "ellipsis" },
+      );
+      if (maxLines <= 1 && !singleLine) {
+        declarations.push({ property: "white-space", value: "nowrap" });
+      } else {
+        declarations.push(
+          { property: "display", value: "-webkit-box" },
+          { property: "-webkit-box-orient", value: "vertical" },
+          { property: "-webkit-line-clamp", value: String(maxLines) },
+        );
+      }
+    }
     for (const group of [
       cssEnumDeclaration("text-align", definition.textAlignHorizontal, {
         LEFT: "left",
@@ -2462,6 +2611,19 @@ function removeMarkupAttribute(opening, name) {
   );
 }
 
+function upsertMarkupAttribute(opening, name, escapedValue) {
+  const pattern = new RegExp(
+    `(\\s${escapeRegExp(name)}\\s*=\\s*)(["'])[^"']*\\2`,
+    "i",
+  );
+  if (pattern.test(opening)) {
+    return opening.replace(pattern, (_match, prefix, quote) =>
+      `${prefix}${quote}${escapedValue}${quote}`,
+    );
+  }
+  return opening.replace(/\s*\/?>$/, ` ${name}="${escapedValue}">`);
+}
+
 function sourceLineIndent(source, index) {
   const lineStart = source.lastIndexOf("\n", index - 1) + 1;
   const before = source.slice(lineStart, index);
@@ -2498,10 +2660,22 @@ function decodeSvgPayload(payload) {
   if (bytes.length === 0 || bytes.length > 768 * 1024) {
     return { ok: false, reason: "invalid_svg_payload" };
   }
-  const svg = bytes.toString("utf8");
+  const svg = sanitizeFigmaSvg(bytes.toString("utf8"));
   return isSafeFigmaSvg(svg)
     ? { ok: true, svg }
     : { ok: false, reason: "unsafe_svg_export" };
+}
+
+function sanitizeFigmaSvg(svg) {
+  // Figma exports background blur as an XHTML foreignObject. Embedding arbitrary
+  // HTML in generated source is intentionally forbidden, but rejecting the
+  // whole vector also prevents otherwise safe page seeds from being applied.
+  // Drop only that unsupported visual layer; the following strict SVG validator
+  // still rejects scripts, remote references, event handlers, and malformed XML.
+  return svg.replace(
+    /<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi,
+    "",
+  );
 }
 
 function isSafeFigmaSvg(svg) {
@@ -2668,6 +2842,23 @@ function renderManagedRules(source, rules) {
     )
     .join("\n\n");
   return `${withoutBlock}\n\n${MARKER_START}\n${rendered}\n${MARKER_END}\n`;
+}
+
+function renderStandaloneRules(rules, { backgroundColor = null } = {}) {
+  const rendered = rules.map(
+    ({ selector, declarations }) =>
+      `${selector} {\n${declarations
+        .map(({ property, value }) => `  ${property}: ${value};`)
+        .join("\n")}\n}`,
+  ).join("\n\n");
+  return [
+    "html, body { margin: 0; min-height: 100%; }",
+    `body { min-height: 100vh;${cssColor(backgroundColor) ? ` background: ${cssColor(backgroundColor)};` : ""} }`,
+    "button { margin: 0; padding: 0; border: 0; appearance: none; background: transparent; color: inherit; font: inherit; }",
+    "img, svg { display: block; max-width: 100%; }",
+    rendered,
+    "",
+  ].join("\n\n");
 }
 
 function managedBlock(source) {

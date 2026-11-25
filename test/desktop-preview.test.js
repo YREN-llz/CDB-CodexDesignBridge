@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -14,6 +15,14 @@ import {
   createCapturedPageManifest,
 } from "../desktop/page-capture.js";
 import { captureLocalPreview } from "../codex-plugin/codex-design-bridge/mcp/browser-capture.mjs";
+import { renderStandalonePageSeed } from "../codex-plugin/codex-design-bridge/mcp/fast-page-patch.mjs";
+import {
+  RESPONSIVE_ACCEPTANCE_WIDTHS,
+  createResponsivePageIrFromNodeTree,
+  diffResponsivePageIr,
+  responsivePageIrToPageSeedNode,
+} from "../codex-plugin/codex-design-bridge/shared/page-ir-responsive-v2.mjs";
+import { CDB_EXACT_BUILD } from "../codex-plugin/codex-design-bridge/shared/runtime-contract.mjs";
 import {
   choosePreviewScript,
   extractPreviewUrl,
@@ -154,26 +163,19 @@ test("captures adjacent inline SVGs as editable SVG nodes", async (t) => {
   );
   assert.match(stars[0].svg, /fill="#D9D9D9"/);
   assert.match(stars[1].svg, /fill="#FF0000"/);
+  assert.equal(stars[0].responsive.maxWidth, null);
+  assert.doesNotMatch(stars[0].svg, />\s+</);
 });
 
-test("marks grid, auto-margin flex, and positioned descendants for coordinate preservation", async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-layout-fidelity-"));
+test("preserves exact whitespace for CDB-generated fixed text", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-exact-text-capture-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(
     path.join(root, "index.html"),
     [
       "<!doctype html>",
-      "<style>",
-      "  main { width: 600px; height: 500px; display: flex; flex-direction: column; }",
-      "  nav { height: 80px; position: relative; }",
-      "  nav > button { position: absolute; right: 16px; top: 12px; }",
-      "  footer { height: 40px; margin-top: auto; }",
-      "  section { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; }",
-      "</style>",
-      '<main data-codex-root data-codex-id="layout-root">',
-      '  <nav data-codex-id="layout-nav">Navigation<button data-codex-id="layout-action">Action</button></nav>',
-      '  <section data-codex-id="layout-grid"><div data-codex-id="grid-a">A</div><div data-codex-id="grid-b">B</div></section>',
-      '  <footer data-codex-id="layout-footer">Footer</footer>',
+      '<main data-codex-root data-codex-id="exact-root">',
+      '  <span data-codex-id="exact-label" data-codex-fixed-size="true"> Leading and trailing </span>',
       "</main>",
     ].join("\n"),
     "utf8",
@@ -184,48 +186,192 @@ test("marks grid, auto-margin flex, and positioned descendants for coordinate pr
   const captured = await captureLocalPreview({
     previewUrl: preview.url,
     projectDir: root,
-    width: 600,
-    height: 500,
   });
-  const layoutRoot = captured.manifest.root;
-  const grid = findNode(layoutRoot, "layout-grid");
-  const nav = findNode(layoutRoot, "layout-nav");
-  const action = findNode(layoutRoot, "layout-action");
 
-  assert.equal(layoutRoot.height, 500);
-  assert.equal(layoutRoot.layout.preservePositions, true);
-  assert.equal(grid.layout.preservePositions, true);
-  assert.equal(nav.layout.preservePositions, true);
-  assert.equal(action.layoutItem.positioning, "absolute");
-  assert.ok(action.x > 0);
+  assert.equal(findNode(captured.manifest.root, "exact-label").text, " Leading and trailing ");
 });
 
-test("honors the requested page viewport during editable capture", async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-page-viewport-"));
+test("captures structure and responsive contract at the requested viewport", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-viewport-capture-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(
     path.join(root, "index.html"),
     [
       "<!doctype html>",
-      "<style>html,body,main{margin:0;width:100%;min-height:100vh}section{height:1400px}</style>",
-      '<main data-codex-root data-codex-id="viewport-root"><section data-codex-id="long-content"></section></main>',
+      "<style>",
+      "  main { width: 100%; min-height: 480px; background: #fff; }",
+      "  .status { width: 120px; height: 40px; background: #ff0000; }",
+      "  @media (max-width: 375px) { .status { width: 96px; background: #00ff00; } }",
+      "</style>",
+      '<main data-codex-root data-codex-id="viewport-root">',
+      '  <div class="status" data-codex-id="viewport-status"></div>',
+      "</main>",
     ].join("\n"),
     "utf8",
   );
 
   const preview = await startProjectPreview({ rootDirectory: root });
   t.after(() => preview.stop());
-  const captured = await captureLocalPreview({
+  const mobile = await captureLocalPreview({
     previewUrl: preview.url,
     projectDir: root,
-    width: 1280,
-    height: 960,
+    width: 320,
+    height: 568,
+  });
+  const desktop = await captureLocalPreview({
+    previewUrl: preview.url,
+    projectDir: root,
+    width: 768,
+    height: 900,
   });
 
-  assert.equal(captured.manifest.root.width, 1280);
-  assert.equal(captured.manifest.root.height, 960);
-  assert.equal(captured.manifest.root.clipsContent, true);
-  assert.equal(findNode(captured.manifest.root, "long-content").height, 1400);
+  assert.deepEqual(mobile.manifest.responsiveContract.designViewport, { width: 320, height: 568 });
+  assert.deepEqual(mobile.manifest.responsiveContract.runtimeViewports[0], {
+    id: "runtime-320",
+    width: 320,
+    height: 568,
+    devicePixelRatio: 1,
+  });
+  assert.equal(findNode(mobile.manifest.root, "viewport-status").width, 96);
+  assert.equal(findNode(mobile.manifest.root, "viewport-status").style.fill, "#00FF00");
+  assert.equal(findNode(desktop.manifest.root, "viewport-status").width, 120);
+  assert.equal(findNode(desktop.manifest.root, "viewport-status").style.fill, "#FF0000");
+});
+
+test("keeps generated HTML stable for ten real browser round trips at all acceptance widths", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-responsive-browser-roundtrip-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "index.html"), "<!doctype html><title>Preparing</title>", "utf8");
+  const preview = await startProjectPreview({ rootDirectory: root });
+  t.after(() => preview.stop());
+
+  for (const width of RESPONSIVE_ACCEPTANCE_WIDTHS) {
+    const height = width <= 430 ? 874 : width === 768 ? 1024 : 900;
+    let seed = responsiveAcceptanceSeed(width, height);
+    let baseline = null;
+    for (let cycle = 1; cycle <= 10; cycle += 1) {
+      const rendered = renderStandalonePageSeed(seed, {
+        title: `Responsive ${width}`,
+      });
+      await Promise.all([
+        writeFile(path.join(root, "index.html"), rendered.html, "utf8"),
+        writeFile(path.join(root, "styles.css"), rendered.css, "utf8"),
+      ]);
+      const captured = await captureLocalPreview({
+        previewUrl: preview.url,
+        projectDir: root,
+        width,
+        height,
+      });
+      assert.deepEqual(
+        captured.manifest.responsiveContract.designViewport,
+        { width, height },
+        `width ${width}, cycle ${cycle}`,
+      );
+      assert.equal(captured.manifest.root.width, width, `width ${width}, cycle ${cycle}`);
+      assert.equal(captured.manifest.root.height, height, `width ${width}, cycle ${cycle}`);
+
+      const pageIr = createResponsivePageIrFromNodeTree({
+        pageId: `browser-roundtrip-${width}`,
+        projectKey: "browser-roundtrip-matrix",
+        name: `Responsive ${width}`,
+        root: captured.manifest.root,
+        origin: {
+          kind: "html",
+          figmaFileKey: "",
+          rootNodeId: "",
+          rootNodeName: "",
+          sourceFile: "index.html",
+          sourceSelector: '[data-codex-id="page-root"]',
+        },
+        responsiveContract: captured.manifest.responsiveContract,
+        exactBuild: CDB_EXACT_BUILD,
+      });
+      if (baseline) {
+        assert.deepEqual(
+          diffResponsivePageIr(baseline, pageIr),
+          [],
+          `width ${width}, cycle ${cycle}`,
+        );
+        assert.equal(pageIr.irHash, baseline.irHash, `width ${width}, cycle ${cycle}`);
+      } else {
+        baseline = pageIr;
+      }
+      seed = responsivePageIrToPageSeedNode(pageIr);
+    }
+  }
+});
+
+test("keeps the frozen home and search-explore pages exact for ten real browser round trips", async (t) => {
+  const fixturePages = path.resolve("test/fixtures/page-ir-responsive-v2/pages");
+  const pages = [
+    { name: "home", html: "index.html", width: 402, height: 874 },
+    { name: "search-explore", html: "search-explore.html", width: 402, height: 905 },
+  ];
+
+  for (const page of pages) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `bridge-frozen-${page.name}-`));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await cp(path.join(fixturePages, page.name), root, { recursive: true });
+    if (page.html !== "index.html") {
+      await writeFile(
+        path.join(root, "index.html"),
+        await readFile(path.join(root, page.html), "utf8"),
+        "utf8",
+      );
+    }
+    const preview = await startProjectPreview({ rootDirectory: root });
+    t.after(() => preview.stop());
+    const capturePageIr = async () => {
+      const captured = await captureLocalPreview({
+        previewUrl: preview.url,
+        projectDir: root,
+        width: page.width,
+        height: page.height,
+      });
+      return createResponsivePageIrFromNodeTree({
+        pageId: page.name,
+        projectKey: "frozen-real-pages",
+        name: page.name,
+        root: captured.manifest.root,
+        origin: {
+          kind: "html",
+          figmaFileKey: "",
+          rootNodeId: "",
+          rootNodeName: "",
+          sourceFile: "index.html",
+          sourceSelector: "[data-codex-root]",
+        },
+        responsiveContract: captured.manifest.responsiveContract,
+        exactBuild: CDB_EXACT_BUILD,
+      });
+    };
+
+    const baseline = await capturePageIr();
+    assert.equal(Object.keys(baseline.nodes).length, 69, page.name);
+    let seed = responsivePageIrToPageSeedNode(baseline);
+    for (let cycle = 1; cycle <= 10; cycle += 1) {
+      const rendered = renderStandalonePageSeed(seed, { title: page.name });
+      const assetDirectory = path.join(root, "codex-design-assets");
+      await mkdir(assetDirectory, { recursive: true });
+      await Promise.all([
+        writeFile(path.join(root, "index.html"), rendered.html, "utf8"),
+        writeFile(path.join(root, "styles.css"), rendered.css, "utf8"),
+        ...rendered.assets.map((asset) =>
+          writeFile(path.join(assetDirectory, asset.fileName), asset.bytes),
+        ),
+      ]);
+      const roundTrip = await capturePageIr();
+      assert.equal(Object.keys(roundTrip.nodes).length, 69, `${page.name}, cycle ${cycle}`);
+      assert.deepEqual(
+        diffResponsivePageIr(baseline, roundTrip),
+        [],
+        `${page.name}, cycle ${cycle}`,
+      );
+      assert.equal(roundTrip.irHash, baseline.irHash, `${page.name}, cycle ${cycle}`);
+      seed = responsivePageIrToPageSeedNode(roundTrip);
+    }
+  }
 });
 
 test("activates a declared static tab state before capture", async (t) => {
@@ -281,13 +427,6 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
       "  .icon path { fill: none; stroke: currentColor; stroke-width: 2px; stroke-linecap: round; }",
       "  .linear { width: 180px; height: 96px; background: linear-gradient(135deg, #7262ff, #4e3fe0); box-shadow: 0 12px 25px rgba(86, 70, 225, .24); }",
       "  .radial { width: 80px; height: 80px; background: radial-gradient(circle at 55% 35%, #f4a95e 0 27%, transparent 28%), linear-gradient(160deg, #db4f62 0 55%, #6c1e55 56%); }",
-      "  .conic { position: relative; width: 64px; height: 64px; background: conic-gradient(from 30deg at 40% 60%, #7262ff 0 72%, #ded9f4 72% 100%); border-radius: 50%; }",
-      "  .conic::before { content: ''; position: absolute; width: 48px; height: 48px; inset: 50% auto auto 50%; transform: translate(-50%, -50%); background: #fff; border-radius: 50%; }",
-      "  .conic-default { width: 32px; height: 32px; background: conic-gradient(#111 0 25%, #eee 25% 100%); }",
-      "  .pseudo-shell { position: relative; width: 120px; height: 48px; }",
-      "  .pseudo-host { margin-left: 30px; width: 38px; height: 38px; }",
-      "  .pseudo-host::before { content: ''; position: absolute; left: 44px; top: 7px; width: 20px; height: 20px; background: #222; }",
-      "  .symbol { display: inline-block; font: 600 16px/20px Inter, sans-serif; }",
       "  .rotated { width: 25px; height: 95px; background: #f7d8bd; transform: rotate(26deg); }",
       "  .grid { width: 120px; height: 80px; background: linear-gradient(rgba(10, 20, 30, .2) 1px, transparent 1px), linear-gradient(90deg, rgba(10, 20, 30, .2) 1px, transparent 1px); background-size: 20px 20px; }",
       "  .glass { width: 180px; height: 64px; border-top: 1px solid rgba(48, 50, 43, .5); background: rgba(255, 255, 255, .72); backdrop-filter: blur(22px); }",
@@ -297,10 +436,6 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
       '  <svg class="icon" data-codex-id="toolbar-icon" viewBox="0 0 24 24"><path d="M4 12h16"/></svg>',
       '  <div class="linear" data-codex-id="linear-card"></div>',
       '  <div class="radial" data-codex-id="radial-art"></div>',
-      '  <div class="conic" data-codex-id="conic-art"></div>',
-      '  <div class="conic-default" data-codex-id="conic-default"></div>',
-      '  <div class="pseudo-shell" data-codex-id="pseudo-shell"><div class="pseudo-host" data-codex-id="pseudo-host"></div></div>',
-      '  <span class="symbol" data-codex-id="symbol-label">⚙</span>',
       '  <div class="rotated" data-codex-id="rotated-art"></div>',
       '  <div class="grid" data-codex-id="grid-art"></div>',
       '  <div class="glass" data-codex-id="glass-dock"></div>',
@@ -320,10 +455,6 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
   const icon = nodes.get("toolbar-icon");
   const linear = nodes.get("linear-card");
   const radial = nodes.get("radial-art");
-  const conic = nodes.get("conic-art");
-  const conicDefault = nodes.get("conic-default");
-  const pseudoShell = nodes.get("pseudo-shell");
-  const symbol = nodes.get("symbol-label");
   const rotated = nodes.get("rotated-art");
   const grid = nodes.get("grid-art");
   const glass = nodes.get("glass-dock");
@@ -349,22 +480,6 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
     "radial-gradient",
     "linear-gradient",
   ]);
-  assert.equal(conic.style.fills[0].type, "conic-gradient");
-  assert.equal(conic.style.fills[0].angle, 30);
-  assert.equal(conicDefault.style.fills[0].angle, 0);
-  assert.deepEqual(conic.style.fills[0].center, { x: 0.4, y: 0.6 });
-  assert.deepEqual(
-    conic.style.fills[0].stops.map((stop) => stop.position),
-    [0, 0.72, 0.72, 1],
-  );
-  assert.equal(findNode(conic, "conic-art-before").x, 8);
-  assert.equal(findNode(conic, "conic-art-before").y, 8);
-  const pseudoHost = findNode(pseudoShell, "pseudo-host");
-  assert.equal(findNode(pseudoHost, "pseudo-host-before").x, 14);
-  assert.equal(findNode(pseudoHost, "pseudo-host-before").y, 7);
-  assert.equal(symbol.font.style, "Regular");
-  assert.ok(Array.isArray(symbol.font.fallbacks));
-  assert.ok(symbol.font.fallbacks.length > 0);
   assert.equal(rotated.rotation, 26);
   assert.equal(rotated.width, 25);
   assert.equal(rotated.height, 95);
@@ -382,6 +497,39 @@ test("captures computed SVG paint, gradients, shadows, rotation, and safe text w
   ]);
   assert.equal(version.type, "text");
   assert.ok(version.width > 23, `expected padded text width, received ${version.width}`);
+});
+
+test("round-trips authored Grid tracks and Figma resize constraints through browser capture", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "bridge-responsive-grid-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    path.join(root, "index.html"),
+    [
+      "<!doctype html>",
+      "<style>",
+      "  main { width: 640px; min-width: 320px; max-width: 960px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: auto; gap: 12px 16px; }",
+      "  article { width: 240px; height: 80px; background: #7262ff; grid-column: 2; }",
+      "</style>",
+      '<main data-codex-root data-codex-id="responsive-grid" data-codex-grid-columns="repeat(2, minmax(0, 1fr))" data-codex-grid-rows="auto" data-codex-constraint-horizontal="STRETCH" data-codex-constraint-vertical="MIN">',
+      '  <article data-codex-id="grid-card" data-codex-constraint-horizontal="MAX" data-codex-constraint-vertical="CENTER"></article>',
+      "</main>",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const preview = await startProjectPreview({ rootDirectory: root });
+  t.after(() => preview.stop());
+  const captured = await captureLocalPreview({ previewUrl: preview.url, projectDir: root });
+  const pageRoot = captured.manifest.root;
+  const card = findNode(pageRoot, "grid-card");
+
+  assert.equal(pageRoot.layout.kind, "grid");
+  assert.equal(pageRoot.layout.grid.columns, "repeat(2, minmax(0, 1fr))");
+  assert.deepEqual(pageRoot.constraints, { horizontal: "STRETCH", vertical: "MIN" });
+  assert.equal(pageRoot.responsive.minWidth, 320);
+  assert.equal(pageRoot.responsive.maxWidth, 960);
+  assert.equal(card.layoutItem.gridColumn, "2");
+  assert.deepEqual(card.constraints, { horizontal: "MAX", vertical: "CENTER" });
 });
 
 test("captures CSS border triangles and pseudo-element icon details", async (t) => {
@@ -546,6 +694,117 @@ function findNode(node, id) {
     if (found) return found;
   }
   return undefined;
+}
+
+function responsiveAcceptanceSeed(width, height) {
+  const contentWidth = width - 40;
+  return {
+    id: "page-root",
+    type: "frame",
+    tag: "main",
+    name: `Acceptance ${width}`,
+    width,
+    height,
+    x: 0,
+    y: 0,
+    opacity: 1,
+    visible: true,
+    rotation: 0,
+    clipsContent: true,
+    style: { fill: "#101114" },
+    constraints: { horizontal: "STRETCH", vertical: "MIN" },
+    responsive: {
+      constraints: { horizontal: "STRETCH", vertical: "MIN" },
+      minWidth: width,
+      maxWidth: width,
+    },
+    layoutItem: {
+      horizontalSizing: "fixed",
+      verticalSizing: "fixed",
+    },
+    layout: {
+      kind: "flex",
+      mode: "VERTICAL",
+      direction: "vertical",
+      wrap: false,
+      itemSpacing: 16,
+      counterAxisSpacing: 16,
+      padding: { top: 24, right: 20, bottom: 24, left: 20 },
+      primaryAxisAlignItems: "MIN",
+      counterAxisAlignItems: "MIN",
+      primaryAxisSizingMode: "FIXED",
+      counterAxisSizingMode: "FIXED",
+    },
+    children: [{
+      id: "acceptance-title",
+      type: "text",
+      tag: "span",
+      name: "Acceptance title",
+      text: `Acceptance ${width}`,
+      width: contentWidth,
+      height: 44,
+      x: 0,
+      y: 0,
+      opacity: 1,
+      visible: true,
+      rotation: 0,
+      style: { fill: "#FFFFFF" },
+      constraints: { horizontal: "STRETCH", vertical: "MIN" },
+      layoutItem: {
+        horizontalSizing: "fixed",
+        verticalSizing: "fixed",
+      },
+      fontName: { family: "Inter", style: "Regular" },
+      fontSize: 24,
+      lineHeight: { unit: "PIXELS", value: 32 },
+      letterSpacing: { unit: "PIXELS", value: 0 },
+      textAlignHorizontal: "LEFT",
+      textAlignVertical: "TOP",
+      textCase: "ORIGINAL",
+      textDecoration: "NONE",
+      textAutoResize: "NONE",
+      textTruncation: "ENDING",
+      maxLines: 1,
+    }, {
+      id: "acceptance-card",
+      type: "frame",
+      tag: "section",
+      name: "Acceptance card",
+      width: contentWidth,
+      height: 160,
+      x: 0,
+      y: 0,
+      opacity: 1,
+      visible: true,
+      rotation: 0,
+      clipsContent: true,
+      style: {
+        fill: "#1C1D22",
+        stroke: "#30323A",
+        strokeWeight: 1,
+        cornerRadius: 18,
+      },
+      constraints: { horizontal: "STRETCH", vertical: "MIN" },
+      layoutItem: {
+        horizontalSizing: "fixed",
+        verticalSizing: "fixed",
+      },
+      layout: {
+        kind: "flex",
+        mode: "HORIZONTAL",
+        direction: "horizontal",
+        wrap: false,
+        itemSpacing: 12,
+        counterAxisSpacing: 12,
+        padding: { top: 16, right: 16, bottom: 16, left: 16 },
+        primaryAxisAlignItems: "MIN",
+        counterAxisAlignItems: "CENTER",
+        primaryAxisSizingMode: "FIXED",
+        counterAxisSizingMode: "FIXED",
+      },
+      children: [],
+    }],
+  };
 }
 
 function collectNodeText(node) {

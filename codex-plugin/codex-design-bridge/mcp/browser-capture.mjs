@@ -29,7 +29,7 @@ export async function captureLocalPreview({
       previewUrl,
       projectDir,
       captureState,
-      viewport,
+      ...viewport,
     });
   }
 
@@ -48,16 +48,10 @@ export async function captureLocalPreview({
       "--disable-background-networking",
       "--disable-default-apps",
       "--disable-extensions",
-      "--disable-features=OptimizationHints,MediaRouter,Translate",
       "--disable-gpu",
-      "--disable-component-update",
-      "--disable-sync",
       "--hide-scrollbars",
       "--no-default-browser-check",
       "--no-first-run",
-      "--metrics-recording-only",
-      "--password-store=basic",
-      "--use-mock-keychain",
       "--no-sandbox",
       "--remote-allow-origins=*",
       "--remote-debugging-address=127.0.0.1",
@@ -88,6 +82,8 @@ export async function captureLocalPreview({
     const manifest = createCapturedPageManifest(snapshot, {
       projectName: path.basename(path.resolve(projectDir)),
       previewUrl,
+      designViewport: viewport,
+      runtimeViewport: viewport,
     });
     return {
       manifest,
@@ -98,7 +94,9 @@ export async function captureLocalPreview({
     if (!diagnostics) throw error;
     throw new Error(`${error.message}\n${diagnostics}`);
   } finally {
-    scheduleBrowserCleanup(browser, profileDirectory);
+    await stopProcess(browser);
+    browser.stderr?.destroy();
+    await removeCaptureProfile(profileDirectory);
   }
 }
 
@@ -107,6 +105,7 @@ export async function captureLocalPreviewImage({
   width = CAPTURE_WIDTH,
   height = CAPTURE_HEIGHT,
   captureState,
+  fitContent = false,
 }) {
   const viewport = normalizeViewport(width, height);
   const playwright = await loadBundledPlaywright();
@@ -115,6 +114,7 @@ export async function captureLocalPreviewImage({
       previewUrl,
       ...viewport,
       captureState,
+      fitContent,
     });
   }
 
@@ -133,16 +133,10 @@ export async function captureLocalPreviewImage({
       "--disable-background-networking",
       "--disable-default-apps",
       "--disable-extensions",
-      "--disable-features=OptimizationHints,MediaRouter,Translate",
       "--disable-gpu",
-      "--disable-component-update",
-      "--disable-sync",
       "--hide-scrollbars",
       "--no-default-browser-check",
       "--no-first-run",
-      "--metrics-recording-only",
-      "--password-store=basic",
-      "--use-mock-keychain",
       "--no-sandbox",
       "--remote-allow-origins=*",
       "--remote-debugging-address=127.0.0.1",
@@ -164,73 +158,18 @@ export async function captureLocalPreviewImage({
       previewUrl,
       viewport,
       captureState,
+      fitContent,
     );
   } finally {
-    scheduleBrowserCleanup(
-      browser,
-      profileDirectory,
-      "codex-design-preview-",
-    );
+    await stopProcess(browser);
+    browser.stderr?.destroy();
+    await removeCaptureProfile(profileDirectory, "codex-design-preview-");
   }
-}
-
-function scheduleBrowserCleanup(
-  browser,
-  profileDirectory,
-  expectedPrefix = "codex-design-capture-",
-) {
-  browser.stderr?.destroy();
-  const cleanupProfile = () => {
-    void removeCaptureProfile(profileDirectory, expectedPrefix).catch(() => {});
-  };
-  browser.once("exit", cleanupProfile);
-  stopProcess(browser);
 }
 
 async function captureWithPlaywright(
   playwright,
-  { previewUrl, projectDir, captureState, viewport },
-) {
-  const executablePath = await findBrowserExecutable();
-  const browser = await playwright.chromium.launch({
-    executablePath,
-    headless: true,
-    args: ["--disable-gpu", "--no-sandbox"],
-  });
-  try {
-    const page = await browser.newPage({
-      viewport,
-      deviceScaleFactor: 1,
-    });
-    await page.goto(previewUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: START_TIMEOUT_MS,
-    });
-    await page.waitForLoadState("load", { timeout: START_TIMEOUT_MS });
-    await page.evaluate(async () => {
-      if (document.fonts) await document.fonts.ready;
-      await new Promise((resolve) =>
-        requestAnimationFrame(() => requestAnimationFrame(resolve)),
-      );
-    });
-    await activatePlaywrightCaptureState(page, captureState);
-    const snapshot = await page.evaluate(CAPTURE_PAGE_SCRIPT);
-    const manifest = createCapturedPageManifest(snapshot, {
-      projectName: path.basename(path.resolve(projectDir)),
-      previewUrl,
-    });
-    return {
-      manifest,
-      nodeCount: countNodes(manifest.root),
-    };
-  } finally {
-    await browser.close();
-  }
-}
-
-async function captureImageWithPlaywright(
-  playwright,
-  { previewUrl, width, height, captureState },
+  { previewUrl, projectDir, captureState, width, height },
 ) {
   const executablePath = await findBrowserExecutable();
   const browser = await playwright.chromium.launch({
@@ -255,6 +194,57 @@ async function captureImageWithPlaywright(
       );
     });
     await activatePlaywrightCaptureState(page, captureState);
+    const snapshot = await page.evaluate(CAPTURE_PAGE_SCRIPT);
+    const manifest = createCapturedPageManifest(snapshot, {
+      projectName: path.basename(path.resolve(projectDir)),
+      previewUrl,
+      designViewport: { width, height },
+      runtimeViewport: { width, height },
+    });
+    return {
+      manifest,
+      nodeCount: countNodes(manifest.root),
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
+async function captureImageWithPlaywright(
+  playwright,
+  { previewUrl, width, height, captureState, fitContent },
+) {
+  const executablePath = await findBrowserExecutable();
+  const browser = await playwright.chromium.launch({
+    executablePath,
+    headless: true,
+    args: ["--disable-gpu", "--no-sandbox"],
+  });
+  try {
+    const page = await browser.newPage({
+      viewport: { width, height },
+      deviceScaleFactor: 1,
+    });
+    await page.goto(previewUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: START_TIMEOUT_MS,
+    });
+    await page.waitForLoadState("load", { timeout: START_TIMEOUT_MS });
+    await page.evaluate(async () => {
+      if (document.fonts) await document.fonts.ready;
+      await new Promise((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      );
+    });
+    await activatePlaywrightCaptureState(page, captureState);
+    if (fitContent || needsScaledScreenshot(width, height)) {
+      const session = await page.context().newCDPSession(page);
+      return await capturePreviewScreenshot(
+        (method, params) => session.send(method, params),
+        { width, height },
+        fitContent,
+      );
+    }
     const image = await page.screenshot({
       type: "png",
       fullPage: false,
@@ -482,6 +472,7 @@ async function captureTargetImage(
   previewUrl,
   { width, height },
   captureState,
+  fitContent,
 ) {
   const socket = new WebSocket(webSocketUrl);
   const pending = new Map();
@@ -563,20 +554,33 @@ async function captureTargetImage(
       returnByValue: true,
     });
     await activateCdpCaptureState(call, captureState);
-    const captured = await call("Page.captureScreenshot", {
-      format: "png",
-      fromSurface: true,
-      captureBeyondViewport: false,
-    });
-    if (!captured?.data) throw new Error("页面预览图为空。");
-    return {
-      dataUrl: `data:image/png;base64,${captured.data}`,
-      width,
-      height,
-    };
+    return await capturePreviewScreenshot(call, { width, height }, fitContent);
   } finally {
     socket.terminate();
   }
+}
+
+function needsScaledScreenshot(width, height) {
+  return Math.max(width, height) > 4096 || width * height > 4_000_000;
+}
+
+async function capturePreviewScreenshot(call, { width, height }, fitContent) {
+  if (fitContent) {
+    const { cssContentSize } = await call("Page.getLayoutMetrics");
+    height = Math.max(height, Math.ceil(cssContentSize?.height || 0));
+  }
+  const format = fitContent ? "jpeg" : "png";
+  const scaled = needsScaledScreenshot(width, height);
+  const scale = Math.min(1, 4096 / Math.max(width, height), Math.sqrt(4_000_000 / (width * height)));
+  const captured = await call("Page.captureScreenshot", {
+    format,
+    ...(fitContent ? { quality: 85 } : {}),
+    fromSurface: true,
+    captureBeyondViewport: Boolean(fitContent || scaled),
+    ...(fitContent || scaled ? { clip: { x: 0, y: 0, width, height, scale } } : {}),
+  });
+  if (!captured?.data) throw new Error("页面预览图为空。");
+  return { dataUrl: `data:image/${format};base64,${captured.data}`, width, height };
 }
 
 async function waitForDocumentReady(call) {
@@ -691,14 +695,21 @@ async function reservePort() {
   return port;
 }
 
-function stopProcess(child) {
+async function stopProcess(child) {
   if (!child?.pid || child.exitCode !== null) return;
-  try {
-    child.kill(process.platform === "win32" ? undefined : "SIGTERM");
-  } catch {
-    // The capture result is already complete; cleanup must never block it.
+  if (process.platform === "win32") {
+    await new Promise((resolve) => {
+      const killer = spawn(
+        "taskkill.exe",
+        ["/pid", String(child.pid), "/t", "/f"],
+        { windowsHide: true, stdio: "ignore" },
+      );
+      killer.once("error", resolve);
+      killer.once("exit", resolve);
+    });
+    return;
   }
-  child.unref?.();
+  child.kill("SIGTERM");
 }
 
 async function removeCaptureProfile(
@@ -739,8 +750,8 @@ function normalizeViewport(width, height) {
     ? Math.round(height)
     : CAPTURE_HEIGHT;
   return {
-    width: Math.min(1920, Math.max(320, normalizedWidth)),
-    height: Math.min(1200, Math.max(480, normalizedHeight)),
+    width: Math.min(8192, Math.max(1, normalizedWidth)),
+    height: Math.min(8192, Math.max(1, normalizedHeight)),
   };
 }
 

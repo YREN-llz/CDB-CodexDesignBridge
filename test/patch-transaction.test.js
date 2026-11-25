@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
   commitPatchTransaction,
   hashContent,
+  recoverIncompletePatchTransactions,
   undoLastPatchTransaction,
-  undoPatchTransactionById,
 } from "../codex-plugin/codex-design-bridge/mcp/patch-transaction.mjs";
 
 test("commits a multi-file patch and safely undoes it", async (t) => {
@@ -39,7 +40,15 @@ test("commits a multi-file patch and safely undoes it", async (t) => {
   assert.equal(await readFile(htmlFile, "utf8"), "<h1>After</h1>\n");
   assert.equal(await readFile(cssFile, "utf8"), "h1 { color: blue; }\n");
 
-  const undone = await undoLastPatchTransaction(projectDir);
+  await assert.rejects(
+    undoLastPatchTransaction(projectDir, { expectedTransactionId: "different-transaction" }),
+    (error) => error.code === "undo_transaction_not_latest",
+  );
+  assert.equal(await readFile(htmlFile, "utf8"), "<h1>After</h1>\n");
+
+  const undone = await undoLastPatchTransaction(projectDir, {
+    expectedTransactionId: result.transactionId,
+  });
   assert.equal(undone.status, "committed");
   assert.equal(undone.undoneTransactionId, result.transactionId);
   assert.equal(await readFile(htmlFile, "utf8"), "<h1>Before</h1>\n");
@@ -117,35 +126,65 @@ test("refuses undo after an unrelated edit", async (t) => {
   assert.equal(await readFile(file, "utf8"), "unrelated user edit");
 });
 
-test("undo by id never rolls back a different transaction", async (t) => {
-  const projectDir = await mkdtemp(path.join(os.tmpdir(), "cdb-exact-undo-"));
+test("recovers a multi-file transaction after its process is killed mid-commit", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "cdb-crash-recovery-"));
   const first = path.join(projectDir, "first.txt");
   const second = path.join(projectDir, "second.txt");
   await writeFile(first, "first before", "utf8");
   await writeFile(second, "second before", "utf8");
   t.after(() => rm(projectDir, { recursive: true, force: true }));
 
-  const firstPatch = await commitPatchTransaction({
+  const crashed = spawn(process.execPath, [
+    path.resolve("scripts/test-fixtures/patch-transaction-crash.mjs"),
     projectDir,
-    writes: [{ file: first, content: "first after" }],
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  const exit = await new Promise((resolve, reject) => {
+    crashed.once("error", reject);
+    crashed.once("exit", (code, signal) => resolve({ code, signal }));
   });
-  await commitPatchTransaction({
-    projectDir,
-    writes: [{ file: second, content: "second after" }],
-  });
+  assert.equal(exit.signal, "SIGKILL");
+  assert.equal(await readFile(first, "utf8"), "first after");
+  assert.equal(await readFile(second, "utf8"), "second before");
 
-  const undone = await undoPatchTransactionById(
-    projectDir,
-    firstPatch.transactionId,
-  );
-  assert.equal(undone.undoneTransactionId, firstPatch.transactionId);
+  const recovered = await recoverIncompletePatchTransactions(projectDir);
+  assert.equal(recovered.recoveredCount, 1);
+  assert.deepEqual(recovered.changedFiles, ["first.txt"]);
   assert.equal(await readFile(first, "utf8"), "first before");
-  assert.equal(await readFile(second, "utf8"), "second after");
-
-  const missing = await undoPatchTransactionById(
-    projectDir,
-    "1-00000000-0000-0000-0000-000000000000",
+  assert.equal(await readFile(second, "utf8"), "second before");
+  assert.equal(
+    (await readdir(projectDir)).filter((name) => name.includes(".cdb-")).length,
+    0,
   );
-  assert.equal(missing.status, "nothing_to_undo");
-  assert.equal(await readFile(second, "utf8"), "second after");
+  assert.equal(
+    (await recoverIncompletePatchTransactions(projectDir)).recoveredCount,
+    0,
+  );
+});
+
+test("preserves an external edit instead of guessing during crash recovery", async (t) => {
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), "cdb-crash-conflict-"));
+  const first = path.join(projectDir, "first.txt");
+  const second = path.join(projectDir, "second.txt");
+  await writeFile(first, "first before", "utf8");
+  await writeFile(second, "second before", "utf8");
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+
+  const crashed = spawn(process.execPath, [
+    path.resolve("scripts/test-fixtures/patch-transaction-crash.mjs"),
+    projectDir,
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  await new Promise((resolve, reject) => {
+    crashed.once("error", reject);
+    crashed.once("exit", resolve);
+  });
+  await writeFile(first, "user edit after crash", "utf8");
+
+  await assert.rejects(
+    recoverIncompletePatchTransactions(projectDir),
+    (error) =>
+      error.code === "transaction_recovery_conflict" &&
+      error.conflicts?.[0]?.path === "first.txt",
+  );
+  assert.equal(await readFile(first, "utf8"), "user edit after crash");
+  assert.equal(await readFile(second, "utf8"), "second before");
 });
