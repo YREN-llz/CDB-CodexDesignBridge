@@ -57,9 +57,9 @@ const MAX_INSERTED_IMAGE_BYTES = 2 * 1024 * 1024;
 const PAGE_CHANGE_PROTOCOL_VERSION = 16;
 const DESIGN_OFFER_PROTOCOL_VERSION = 16;
 const PAGE_IR_SCHEMA_VERSION = 2;
-const CDB_EXACT_BUILD = "0.9.0+codex.20260829100031";
+const CDB_EXACT_BUILD = "0.9.0+codex.20261125201405";
 const CDB_RUNTIME_IDENTITY = "cdb-0.9-responsive-v2";
-const RESPONSIVE_ACCEPTANCE_WIDTHS = new Set([320, 375, 402, 430, 768, 1440]);
+const MAX_DESIGN_VIEWPORT_SIZE = 8192;
 const MAX_DESIGN_OFFER_NODES = 500;
 const DESIGN_RECOVERY_STORAGE_KEY = "cdbDesignRecovery";
 const EDITABLE_PROPERTIES = new Set([
@@ -401,7 +401,7 @@ function reportDesignSelection() {
   const supported = Boolean(
     root &&
     DESIGN_ROOT_TYPES.has(root.type) &&
-    RESPONSIVE_ACCEPTANCE_WIDTHS.has(Number(root.width)),
+    isDesignViewportSupported(root),
   );
   const estimatedNodeCount = supported ? countDesignNodes(root, MAX_DESIGN_OFFER_NODES + 1) : 0;
   figma.ui.postMessage({
@@ -412,8 +412,8 @@ function reportDesignSelection() {
         ? "请选择一个完整页面"
         : !root || !DESIGN_ROOT_TYPES.has(root.type)
           ? "请选择 Frame、Component、Instance 或 Group"
-          : !RESPONSIVE_ACCEPTANCE_WIDTHS.has(Number(root.width))
-            ? "页面宽度不在 0.9 验收合同内"
+          : !isDesignViewportSupported(root)
+            ? "画板宽高需在 1 到 8192 像素之间"
           : estimatedNodeCount > MAX_DESIGN_OFFER_NODES
             ? `可编辑图层超过 ${MAX_DESIGN_OFFER_NODES} 个`
             : "",
@@ -520,11 +520,17 @@ function currentRuntimeIdentity() {
   };
 }
 
+function isDesignViewportSupported(root) {
+  return [root?.width, root?.height].every((value) =>
+    Number.isFinite(value) && value >= 1 && value <= MAX_DESIGN_VIEWPORT_SIZE,
+  );
+}
+
 function responsiveContractForRoot(root) {
   const width = Number(root?.width || 0);
   const height = Number(root?.height || 0);
-  if (!RESPONSIVE_ACCEPTANCE_WIDTHS.has(width) || !Number.isFinite(height) || height <= 0) {
-    throw new Error("页面 viewport 不在 0.9 明确支持合同内，不能推测响应式规则。");
+  if (!isDesignViewportSupported(root)) {
+    throw new Error("画板宽高需在 1 到 8192 像素之间。");
   }
   return {
     designViewport: { width, height },
@@ -4103,7 +4109,7 @@ function snapshotDesignProperties(node) {
 }
 
 async function exportDesignScreenshot(root) {
-  const width = Math.max(1, Math.min(1200, Math.round(root.width)));
+  const width = Math.max(1, Math.floor(Math.min(root.width, 1200, 4096 * root.width / root.height)));
   let bytes = await root.exportAsync({
     format: "PNG",
     constraint: { type: "WIDTH", value: width },

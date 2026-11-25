@@ -135,6 +135,7 @@ const tools = [
       openWorldHint: false,
     },
     _meta: {
+      ui: { resourceUri: UI_URI },
       "ui.resourceUri": UI_URI,
       "openai/outputTemplate": UI_URI,
       "openai/toolInvocation/invoking": "正在连接 CDB",
@@ -179,6 +180,7 @@ const tools = [
       openWorldHint: false,
     },
     _meta: {
+      ui: { resourceUri: UI_URI },
       "ui.resourceUri": UI_URI,
       "openai/outputTemplate": UI_URI,
       "openai/toolInvocation/invoking": "正在打开 CDB",
@@ -259,6 +261,16 @@ const tools = [
         workspaceDir: { type: "string" },
         description: { type: "string", minLength: 1, maxLength: 2_000 },
         projectName: { type: "string", maxLength: 80 },
+        viewport: {
+          type: "object",
+          description: "Requested design canvas size in CSS pixels.",
+          properties: {
+            width: { type: "integer", minimum: 1, maximum: 8192 },
+            height: { type: "integer", minimum: 1, maximum: 8192 },
+          },
+          required: ["width", "height"],
+          additionalProperties: false,
+        },
       },
       required: ["workspaceDir", "description"],
       additionalProperties: false,
@@ -269,6 +281,7 @@ const tools = [
       openWorldHint: false,
     },
     _meta: {
+      ui: { resourceUri: UI_URI },
       "ui.resourceUri": UI_URI,
       "openai/outputTemplate": UI_URI,
       "openai/toolInvocation/invoking": "正在新建设计",
@@ -295,6 +308,7 @@ const tools = [
       openWorldHint: false,
     },
     _meta: {
+      ui: { resourceUri: UI_URI },
       "ui.resourceUri": UI_URI,
       "openai/outputTemplate": UI_URI,
       "openai/toolInvocation/invoking": "正在等待 Figma 页面",
@@ -367,6 +381,7 @@ const tools = [
       openWorldHint: false,
     },
     _meta: {
+      ui: { resourceUri: UI_URI },
       "ui.resourceUri": UI_URI,
       "openai/outputTemplate": UI_URI,
       "openai/toolInvocation/invoking": "正在打开设计工作台",
@@ -487,13 +502,17 @@ const tools = [
         },
         width: {
           type: "integer",
-          minimum: 320,
-          maximum: 1920,
+          minimum: 1,
+          maximum: 8192,
         },
         height: {
           type: "integer",
-          minimum: 480,
-          maximum: 1200,
+          minimum: 1,
+          maximum: 8192,
+        },
+        fitContent: {
+          type: "boolean",
+          description: "Include all vertically scrollable content at the requested viewport width.",
         },
         pageId: {
           type: "string",
@@ -2155,7 +2174,7 @@ async function shutdownWorkspaceResources(
   return updated;
 }
 
-async function getDesignPreviewImage({ projectDir, width, height, pageId }) {
+async function getDesignPreviewImage({ projectDir, width, height, pageId, fitContent }) {
   const project = await normalizeProjectDir(projectDir);
   let state = await getWorkspace(project);
   const preview = await ensurePreview(project, state.previewUrl);
@@ -2171,8 +2190,9 @@ async function getDesignPreviewImage({ projectDir, width, height, pageId }) {
   const page = workspacePage(state, pageId);
   const image = await captureLocalPreviewImage({
     previewUrl: previewUrlForPage(preview.url, page.path),
-    width,
-    height,
+    width: width ?? page.viewport.width,
+    height: height ?? page.viewport.height,
+    fitContent,
     captureState: page.captureState,
   });
   return { state: publicState(state), image };
@@ -4276,7 +4296,7 @@ function browserPreviewUrl(pageUrl, viewport) {
 }
 
 function parseBrowserPreviewViewport(value) {
-  const match = /^(\d{2,5})x(\d{2,5})$/u.exec(String(value || ""));
+  const match = /^(\d{1,4})x(\d{1,4})$/u.exec(String(value || ""));
   if (!match) return null;
   const width = boundedViewportDimension(match[1]);
   const height = boundedViewportDimension(match[2]);
@@ -4287,7 +4307,7 @@ function boundedViewportDimension(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 0;
   const rounded = Math.round(number);
-  return rounded >= 64 && rounded <= 8_192 ? rounded : 0;
+  return rounded >= 1 && rounded <= 8_192 ? rounded : 0;
 }
 
 function injectBrowserPreviewCanvas(html, { width, height }) {
@@ -4314,11 +4334,14 @@ function injectBrowserPreviewCanvas(html, { width, height }) {
     `  const width = ${width};`,
     `  const height = ${height};`,
     "  const fit = () => {",
-    "    const scale = Math.min(1, Math.max(0.05, (innerWidth - 32) / width), Math.max(0.05, (innerHeight - 32) / height));",
+    "    const contentHeight = Math.max(height, root.offsetHeight, root.scrollHeight);",
+    "    canvas.style.height = `${contentHeight}px`;",
+    "    const scale = Math.min(1, Math.max(1, innerWidth - 32) / width, Math.max(1, innerHeight - 32) / contentHeight);",
     "    canvas.style.transform = `scale(${scale})`;",
     "    canvas.dataset.scale = String(scale);",
     "  };",
     "  addEventListener('resize', fit, { passive: true });",
+    "  new ResizeObserver(fit).observe(root);",
     "  fit();",
     "})();",
     "</script>",
@@ -4475,7 +4498,6 @@ function previewImageResult(state, previewImage) {
   return {
     content: [{ type: "text", text: "页面预览已生成。" }],
     structuredContent: { workspace, previewImage },
-    _meta: { workspace, previewImage },
   };
 }
 

@@ -105,6 +105,7 @@ export async function captureLocalPreviewImage({
   width = CAPTURE_WIDTH,
   height = CAPTURE_HEIGHT,
   captureState,
+  fitContent = false,
 }) {
   const viewport = normalizeViewport(width, height);
   const playwright = await loadBundledPlaywright();
@@ -113,6 +114,7 @@ export async function captureLocalPreviewImage({
       previewUrl,
       ...viewport,
       captureState,
+      fitContent,
     });
   }
 
@@ -156,6 +158,7 @@ export async function captureLocalPreviewImage({
       previewUrl,
       viewport,
       captureState,
+      fitContent,
     );
   } finally {
     await stopProcess(browser);
@@ -209,7 +212,7 @@ async function captureWithPlaywright(
 
 async function captureImageWithPlaywright(
   playwright,
-  { previewUrl, width, height, captureState },
+  { previewUrl, width, height, captureState, fitContent },
 ) {
   const executablePath = await findBrowserExecutable();
   const browser = await playwright.chromium.launch({
@@ -234,6 +237,14 @@ async function captureImageWithPlaywright(
       );
     });
     await activatePlaywrightCaptureState(page, captureState);
+    if (fitContent || needsScaledScreenshot(width, height)) {
+      const session = await page.context().newCDPSession(page);
+      return await capturePreviewScreenshot(
+        (method, params) => session.send(method, params),
+        { width, height },
+        fitContent,
+      );
+    }
     const image = await page.screenshot({
       type: "png",
       fullPage: false,
@@ -461,6 +472,7 @@ async function captureTargetImage(
   previewUrl,
   { width, height },
   captureState,
+  fitContent,
 ) {
   const socket = new WebSocket(webSocketUrl);
   const pending = new Map();
@@ -542,20 +554,33 @@ async function captureTargetImage(
       returnByValue: true,
     });
     await activateCdpCaptureState(call, captureState);
-    const captured = await call("Page.captureScreenshot", {
-      format: "png",
-      fromSurface: true,
-      captureBeyondViewport: false,
-    });
-    if (!captured?.data) throw new Error("页面预览图为空。");
-    return {
-      dataUrl: `data:image/png;base64,${captured.data}`,
-      width,
-      height,
-    };
+    return await capturePreviewScreenshot(call, { width, height }, fitContent);
   } finally {
     socket.terminate();
   }
+}
+
+function needsScaledScreenshot(width, height) {
+  return Math.max(width, height) > 4096 || width * height > 4_000_000;
+}
+
+async function capturePreviewScreenshot(call, { width, height }, fitContent) {
+  if (fitContent) {
+    const { cssContentSize } = await call("Page.getLayoutMetrics");
+    height = Math.max(height, Math.ceil(cssContentSize?.height || 0));
+  }
+  const format = fitContent ? "jpeg" : "png";
+  const scaled = needsScaledScreenshot(width, height);
+  const scale = Math.min(1, 4096 / Math.max(width, height), Math.sqrt(4_000_000 / (width * height)));
+  const captured = await call("Page.captureScreenshot", {
+    format,
+    ...(fitContent ? { quality: 85 } : {}),
+    fromSurface: true,
+    captureBeyondViewport: Boolean(fitContent || scaled),
+    ...(fitContent || scaled ? { clip: { x: 0, y: 0, width, height, scale } } : {}),
+  });
+  if (!captured?.data) throw new Error("页面预览图为空。");
+  return { dataUrl: `data:image/${format};base64,${captured.data}`, width, height };
 }
 
 async function waitForDocumentReady(call) {
@@ -725,8 +750,8 @@ function normalizeViewport(width, height) {
     ? Math.round(height)
     : CAPTURE_HEIGHT;
   return {
-    width: Math.min(1920, Math.max(320, normalizedWidth)),
-    height: Math.min(1200, Math.max(480, normalizedHeight)),
+    width: Math.min(8192, Math.max(1, normalizedWidth)),
+    height: Math.min(8192, Math.max(1, normalizedHeight)),
   };
 }
 

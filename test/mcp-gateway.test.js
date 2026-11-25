@@ -548,7 +548,7 @@ function protocol16() {
       kind: "cdb-0.9-responsive-v2",
       protocolVersion: 16,
       pageIrSchemaVersion: 2,
-      exactBuild: "0.9.0+codex.20260829100031",
+      exactBuild: "0.9.0+codex.20261125201405",
     },
   };
 }

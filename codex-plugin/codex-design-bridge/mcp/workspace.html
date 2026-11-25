@@ -1902,16 +1902,19 @@
         const compatibilityBridge = window.openai;
         const pendingRequests = new Map();
         let nextRequestId = 1;
+        let hostReady;
+        let reportedProject = "";
         const bridge = {
           toolOutput: compatibilityBridge?.toolOutput,
-          callTool(name, args) {
-            if (compatibilityBridge?.callTool) {
-              return compatibilityBridge.callTool(name, args);
+          async callTool(name, args, timeoutMs) {
+            if (window.openai?.callTool) {
+              return window.openai.callTool(name, args);
             }
+            if (!await hostReady) throw new Error("未能连接 Codex 工作台，请重新打开 CDB。");
             return requestHost("tools/call", {
               name,
               arguments: args,
-            });
+            }, timeoutMs);
           },
           requestDisplayMode: compatibilityBridge?.requestDisplayMode
             ? (options) => compatibilityBridge.requestDisplayMode(options)
@@ -2021,6 +2024,8 @@
         let previewKey = "";
         let previewLoading = false;
         let previewReady = false;
+        let previewSize = null;
+        let previewFailed = false;
         let previewUsingFallback = false;
         let previewRequestId = 0;
         let previewLoadTimer = null;
@@ -2073,6 +2078,10 @@
 
             if (message.method === "ui/notifications/tool-result") {
               applyToolResult(message.params);
+            } else if (message.method === "ui/notifications/host-context-changed") {
+              applyHostContext(message.params);
+            } else if (message.method === "ping" && message.id !== undefined) {
+              window.parent.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*");
             }
           },
           { passive: true },
@@ -2137,7 +2146,7 @@
           resetPreviewPan();
           updatePreviewGeometry(previewDimensions());
           applyPreviewTransform();
-          if (previewUsingFallback) void loadPreviewFallback(previewRequestId);
+          if (state.previewUrl) loadPreview();
           render();
         });
 
@@ -2394,6 +2403,7 @@
         });
 
         render();
+        hostReady = connectHost();
         ensurePolling();
         schedulePendingFigmaHandoff();
         void reportMounted();
@@ -2626,7 +2636,9 @@
         }
 
         async function reportMounted() {
-          if (!state.projectDir) return;
+          if (window.parent === window || !state.projectDir ||
+              reportedProject === state.projectDir) return;
+          reportedProject = state.projectDir;
           const result = await callTool(
             "report_design_workspace_mounted",
             { projectDir: state.projectDir },
@@ -2686,7 +2698,7 @@
           if (!bridge?.callTool) return null;
           try {
             return await withTimeout(
-              Promise.resolve().then(() => bridge.callTool(name, args)),
+              Promise.resolve().then(() => bridge.callTool(name, args, timeoutMs)),
               timeoutMs,
             );
           } catch (error) {
@@ -2722,18 +2734,50 @@
           });
         }
 
-        function requestHost(method, params) {
+        async function connectHost() {
+          if (window.parent === window) return false;
+          try {
+            const result = await requestHost("ui/initialize", {
+              protocolVersion: "2026-01-26",
+              appInfo: { name: "Codex Design Bridge", version: "0.9.0" },
+              appCapabilities: {},
+            });
+            window.parent.postMessage({
+              jsonrpc: "2.0",
+              method: "ui/notifications/initialized",
+            }, "*");
+            applyHostContext(result?.hostContext);
+            return true;
+          } catch {
+            if (!window.openai?.callTool && state.phase === "opening") {
+              setState({
+                ...state,
+                phase: "error",
+                message: "未能连接 Codex 工作台，请重新打开 CDB。",
+              });
+            }
+            return false;
+          }
+        }
+
+        function applyHostContext(context) {
+          if (!context?.displayMode) return;
+          displayMode = normalizeDisplayMode(context.displayMode);
+          renderDisplayMode();
+        }
+
+        function requestHost(method, params, timeoutMs = 10_000) {
           const id = nextRequestId++;
-          window.parent.postMessage(
-            { jsonrpc: "2.0", id, method, params },
-            "*",
-          );
           return new Promise((resolve, reject) => {
             const timer = window.setTimeout(() => {
               pendingRequests.delete(id);
               reject(new Error(`Host request timed out: ${method}`));
-            }, 10_000);
+            }, timeoutMs);
             pendingRequests.set(id, { resolve, reject, timer });
+            window.parent.postMessage(
+              { jsonrpc: "2.0", id, method, params },
+              "*",
+            );
           });
         }
 
@@ -2751,6 +2795,7 @@
           render();
           ensurePolling();
           schedulePendingFigmaHandoff();
+          void reportMounted();
         }
 
         function schedulePendingFigmaHandoff() {
@@ -2994,7 +3039,7 @@
           const activePage = (state.pages || []).find(
             (page) => page.id === state.activePageId,
           );
-          const previewViewport = previewDimensions();
+          const previewViewport = previewSize || previewDimensions();
           updatePreviewGeometry(previewViewport);
           elements.canvasTitle.textContent = activePage?.name || "页面";
           const modeLabel = previewMode === "one-to-one"
@@ -3047,9 +3092,13 @@
             if (state.previewUrl) {
               loadPreview();
             } else {
+              previewRequestId += 1;
+              previewLoading = false;
+              previewSize = null;
+              previewFailed = false;
               clearTimeout(previewLoadTimer);
               elements.preview.removeAttribute("src");
-              elements.previewFallback.removeAttribute("src");
+              elements.previewFallback.hidden = true;
             }
           }
           elements.empty.hidden = previewReady || previewLoading;
@@ -3061,14 +3110,14 @@
               ? "项目预检未通过"
               : preflight?.status === "safe_fix"
                 ? "项目需要安全修复"
-                : state.previewUrl
-                  ? "暂时无法打开实时预览"
+                : previewFailed
+                  ? "HTML 预览加载失败"
                   : "正在准备页面";
           elements.emptyCopy.textContent = state.needsHandoffConfirmation
             ? "确认后才会关闭旧连接并打开当前项目"
             : firstIssue?.message ||
-              (state.previewUrl
-                ? "请点击右上角刷新后重试"
+              (previewFailed
+                ? "请刷新重试，或点击 HTML 在浏览器中查看页面。"
                 : "页面就绪后会直接显示在这里");
           elements.applyFixes.hidden =
             preflight?.status !== "safe_fix" ||
@@ -3547,6 +3596,8 @@
         }
 
         function loadPreview() {
+          previewSize = null;
+          previewFailed = false;
           if (canUseLivePreview()) {
             loadLivePreview();
             return;
@@ -3599,26 +3650,22 @@
             projectDir: state.projectDir,
             pageId: state.activePageId || undefined,
             ...viewport,
-          }, { silent: true, timeoutMs: 15_000 });
+            fitContent: true,
+          }, { silent: true, timeoutMs: 45_000 });
           if (requestId !== previewRequestId) return;
 
           const image = readPreviewImage(result);
           previewReady = false;
-          if (image?.dataUrl) {
-            updatePreviewGeometry(image);
+          try {
+            const bitmap = await createImageBitmap(previewImageBlob(image?.dataUrl || ""));
             try {
-              const bitmap = await createImageBitmap(previewImageBlob(image.dataUrl));
-              if (requestId !== previewRequestId) {
-                bitmap.close();
-                return;
-              }
+              if (requestId !== previewRequestId) return;
               const canvas = elements.previewFallback;
-              canvas.width = image.width || bitmap.width;
-              canvas.height = image.height || bitmap.height;
+              canvas.width = bitmap.width;
+              canvas.height = bitmap.height;
               const context = canvas.getContext("2d");
-              context.clearRect(0, 0, canvas.width, canvas.height);
               context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-              bitmap.close();
+              previewSize = { width: image.width, height: image.height };
               previewReady = true;
               canvas.hidden = false;
               elements.preview.hidden = true;
@@ -3626,15 +3673,14 @@
                 (page) => page.id === state.activePageId,
               );
               canvas.setAttribute("aria-label", `${activePage?.name || state.projectName || "页面"}静态预览`);
-            } catch {
-              previewUsingFallback = false;
-              const context = elements.previewFallback.getContext("2d");
-              context.clearRect(0, 0, elements.previewFallback.width, elements.previewFallback.height);
+            } finally {
+              bitmap.close();
             }
-          } else {
+          } catch {
+            if (requestId !== previewRequestId) return;
+            previewFailed = true;
             previewUsingFallback = false;
-            const context = elements.previewFallback.getContext("2d");
-            context.clearRect(0, 0, elements.previewFallback.width, elements.previewFallback.height);
+            elements.previewFallback.hidden = true;
           }
           previewLoading = false;
           render();
@@ -3851,14 +3897,14 @@
           const width = Number(activePage?.viewport?.width);
           const height = Number(activePage?.viewport?.height);
           const sourceWidth = Number.isFinite(width)
-              ? Math.min(1920, Math.max(320, Math.round(width)))
+              ? Math.min(8192, Math.max(1, Math.round(width)))
               : 1440;
           return {
             width: previewMode === "breakpoint" && Number.isFinite(previewBreakpointWidth)
               ? previewBreakpointWidth
               : sourceWidth,
             height: Number.isFinite(height)
-              ? Math.min(1200, Math.max(480, Math.round(height)))
+              ? Math.min(8192, Math.max(1, Math.round(height)))
               : 900,
           };
         }

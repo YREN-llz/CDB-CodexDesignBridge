@@ -257,9 +257,11 @@ test("requires explicit, non-overlapping breakpoint ranges and known node overri
   };
   assert.throws(() => normalizeResponsivePageIr(unknownNode), /unknown node/u);
 
-  const unsupportedWidth = sampleIr();
-  unsupportedWidth.runtimeViewports[0].width = 390;
-  assert.throws(() => normalizeResponsivePageIr(unsupportedWidth), /outside the 0\.9 acceptance contract/u);
+  const customWidth = sampleIr();
+  customWidth.runtimeViewports[0].width = 390;
+  assert.ok(normalizeResponsivePageIr(customWidth).runtimeViewports.some(({ width }) => width === 390));
+  customWidth.runtimeViewports[0].width = 8193;
+  assert.throws(() => normalizeResponsivePageIr(customWidth), /runtimeViewports\[0\]\.width/u);
   assert.deepEqual(RESPONSIVE_ACCEPTANCE_WIDTHS, [320, 375, 402, 430, 768, 1440]);
 });
 

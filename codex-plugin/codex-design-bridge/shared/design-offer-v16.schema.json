@@ -18,7 +18,7 @@
     "rootNodeId": { "type": "string", "minLength": 1, "maxLength": 128 },
     "rootName": { "type": "string", "minLength": 1, "maxLength": 256 },
     "rootType": { "enum": ["FRAME", "COMPONENT", "INSTANCE", "GROUP"] },
-    "width": { "enum": [320, 375, 402, 430, 768, 1440] },
+    "width": { "type": "number", "minimum": 1, "maximum": 8192 },
     "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 100000 },
     "responsiveContract": { "$ref": "#/$defs/responsiveContract" },
     "estimatedNodeCount": { "type": "integer", "minimum": 1, "maximum": 500 },
@@ -36,7 +36,7 @@
         "kind": { "const": "cdb-0.9-responsive-v2" },
         "protocolVersion": { "const": 16 },
         "pageIrSchemaVersion": { "const": 2 },
-        "exactBuild": { "const": "0.9.0+codex.20260829100031" }
+        "exactBuild": { "const": "0.9.0+codex.20261125201405" }
       },
       "additionalProperties": false
     },

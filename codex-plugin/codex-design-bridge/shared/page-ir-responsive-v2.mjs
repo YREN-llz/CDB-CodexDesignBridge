@@ -743,12 +743,9 @@ function normalizeRuntimeViewports(value) {
     const id = requiredId(viewport.id, `${path}.id`);
     if (ids.has(id)) throw new ResponsivePageIrValidationError("duplicate runtime viewport id", `${path}.id`);
     ids.add(id);
-    if (!RESPONSIVE_ACCEPTANCE_WIDTHS.includes(viewport.width)) {
-      throw new ResponsivePageIrValidationError("width is outside the 0.9 acceptance contract", `${path}.width`);
-    }
     return {
       id,
-      width: viewport.width,
+      width: positiveNumber(viewport.width, 8192, `${path}.width`),
       height: viewport.height == null ? null : positiveNumber(viewport.height, 100_000, `${path}.height`),
       devicePixelRatio: positiveNumber(viewport.devicePixelRatio, 8, `${path}.devicePixelRatio`),
     };

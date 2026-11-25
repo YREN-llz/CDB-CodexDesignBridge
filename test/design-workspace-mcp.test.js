@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { solidVisualReference } from "./helpers/visual-reference.js";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -75,7 +75,7 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   );
   assert.ok(openTool);
   assert.equal(
-    openTool._meta["ui.resourceUri"],
+    openTool._meta.ui.resourceUri,
     "ui://codex-design-bridge/workspace-v2.html",
   );
   assert.ok(
@@ -398,6 +398,7 @@ test("opens an unbound launcher and creates a ready native design without questi
       workspaceDir,
       projectName: "direct-design",
       description: "A focused launch page for a small typography studio",
+      viewport: { width: 1200, height: 1600 },
     },
   });
   const workspace = created.structuredContent.workspace;
@@ -407,6 +408,7 @@ test("opens an unbound launcher and creates a ready native design without questi
   assert.match(workspace.projectName, /typography stu/i);
   assert.equal(workspace.preflightReport.status, "pass");
   assert.equal(workspace.lease.owned, true);
+  assert.deepEqual(workspace.pages[0].viewport, { width: 1200, height: 1600 });
   for (const relative of [
     "index.html",
     "styles.css",
@@ -493,7 +495,7 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
   const offerAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
   socket.send(JSON.stringify({
     type: "figma.design.offer",
-    responsiveContract: responsiveContract(),
+    responsiveContract: responsiveContract(390, 1560),
     ...protocol16(),
     offerId,
     sessionId,
@@ -501,8 +503,8 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
     rootNodeId: "84:1",
     rootName: "New Site",
     rootType: "FRAME",
-    width: 1440,
-    height: 900,
+    width: 390,
+    height: 1560,
     estimatedNodeCount: 1,
     linkedProjectKey: "old-project-key",
     linkedPageId: "old-page-id",
@@ -520,7 +522,7 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
   const resultPromise = waitForSocketMessage(socket, "figma.design.result");
   socket.send(JSON.stringify({
     type: "figma.design.payload",
-    responsiveContract: responsiveContract(),
+    responsiveContract: responsiveContract(390, 1560),
     ...protocol16(),
     offerId,
     sessionId,
@@ -537,8 +539,8 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
         type: "frame",
         tag: "main",
         name: "New Site",
-        width: 1440,
-        height: 900,
+        width: 390,
+        height: 1560,
         opacity: 1,
         visible: true,
         rotation: 0,
@@ -546,7 +548,7 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
         children: [],
       },
     },
-    referenceImage: solidVisualReference(1200, 750),
+    referenceImage: solidVisualReference(390, 1560),
     report: {
       nodeCount: 1,
       resourceBytes: 0,
@@ -570,6 +572,8 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
   assert.equal(result.result.nodeMappings[0].sourceRef.file, "index.html");
 
   const projectDir = result.result.projectDir;
+  const manifest = JSON.parse(await readFile(path.join(projectDir, ".cdb", "manifest.json"), "utf8"));
+  assert.deepEqual(manifest.pages[0].viewport, { width: 390, height: 1560 });
   const baseline = JSON.parse(
     await readFile(
       path.join(projectDir, ".cdb", "sync-baselines", `${result.result.pageId}.json`),
@@ -643,7 +647,7 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
   const updateAckPromise = waitForSocketMessage(socket, "figma.design.offer.ack");
   socket.send(JSON.stringify({
     type: "figma.design.offer",
-    responsiveContract: responsiveContract(),
+    responsiveContract: responsiveContract(390, 1560),
     ...protocol16(),
     offerId: updateOfferId,
     sessionId: updateSessionId,
@@ -651,8 +655,8 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
     rootNodeId: "84:1",
     rootName: "New Site",
     rootType: "FRAME",
-    width: 1440,
-    height: 900,
+    width: 390,
+    height: 1560,
     estimatedNodeCount: 1,
     linkedProjectKey: result.result.projectKey,
     linkedPageId: result.result.pageId,
@@ -676,7 +680,7 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
   const updateResultPromise = waitForSocketMessage(socket, "figma.design.result");
   socket.send(JSON.stringify({
     type: "figma.design.payload",
-    responsiveContract: responsiveContract(),
+    responsiveContract: responsiveContract(390, 1560),
     ...protocol16(),
     offerId: updateOfferId,
     sessionId: updateSessionId,
@@ -693,8 +697,8 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
         type: "frame",
         tag: "main",
         name: "New Site",
-        width: 1440,
-        height: 900,
+        width: 390,
+        height: 1560,
         opacity: 0.96,
         visible: true,
         rotation: 0,
@@ -702,7 +706,7 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
         children: [],
       },
     },
-    referenceImage: solidVisualReference(1200, 750),
+    referenceImage: solidVisualReference(390, 1560),
     report: {
       nodeCount: 1,
       resourceBytes: 0,
@@ -1811,7 +1815,7 @@ test("opens a static frontend without showing a desktop process", async (t) => {
   );
   await writeFile(
     path.join(projectDir, "index.html"),
-    '<!doctype html><title>Visible preview</title><main data-codex-root data-codex-id="preview-root"><h1 data-codex-id="preview-title">Ready</h1></main>',
+    '<!doctype html><title>Visible preview</title><main data-codex-root data-codex-id="preview-root" style="height: 2380px"><h1 data-codex-id="preview-title">Ready</h1></main>',
     "utf8",
   );
   t.after(() => rm(projectDir, { recursive: true, force: true }));
@@ -1861,6 +1865,16 @@ test("opens a static frontend without showing a desktop process", async (t) => {
   );
   assert.equal(preview.structuredContent.previewImage.width, 390);
   assert.equal(preview.structuredContent.previewImage.height, 844);
+
+  const fullPreview = await client.request("tools/call", {
+    name: "get_design_preview_image",
+    arguments: { projectDir, width: 390, height: 844, fitContent: true },
+  });
+  const fullImage = fullPreview.structuredContent.previewImage;
+  assert.match(fullImage.dataUrl, /^data:image\/jpeg;base64,/);
+  assert.equal(fullImage.width, 390);
+  assert.ok(fullImage.height >= 2380, JSON.stringify({ width: fullImage.width, height: fullImage.height }));
+  assert.equal(fullPreview._meta?.previewImage, undefined);
 });
 
 test("manages and persists multiple workspace routes", async (t) => {
@@ -2794,19 +2808,28 @@ function expectedRuntimeSource() {
 }
 
 function startClient(environment = {}) {
+  const temporaryLease = environment.CODEX_DESIGN_BRIDGE_LEASE_ROOT
+    ? null
+    : mkdtempSync(path.join(os.tmpdir(), "cdb-mcp-test-lease-"));
   const child = spawn(process.execPath, [serverPath], {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
     env: {
       ...process.env,
       CODEX_DESIGN_BRIDGE_PORT: "0",
+      CODEX_DESIGN_BRIDGE_LEASE_ROOT: temporaryLease || environment.CODEX_DESIGN_BRIDGE_LEASE_ROOT,
       ...environment,
     },
   });
   let id = 0;
   let stdout = "";
+  let stderr = "";
   const pending = new Map();
 
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    stderr = (stderr + chunk).slice(-4000);
+  });
   child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
     stdout += chunk;
@@ -2831,7 +2854,7 @@ function startClient(environment = {}) {
   });
   child.once("exit", (code, signal) => {
     const error = new Error(
-      `Design workspace server exited before replying (code ${code}, signal ${signal}).`,
+      `Design workspace server exited before replying (code ${code}, signal ${signal}).\n${stderr}`,
     );
     for (const request of pending.values()) request.reject(error);
     pending.clear();
@@ -2847,12 +2870,14 @@ function startClient(environment = {}) {
         );
       });
     },
-    close() {
-      if (child.exitCode !== null) return Promise.resolve();
-      return new Promise((resolve) => {
-        child.once("exit", resolve);
-        child.stdin.end();
-      });
+    async close() {
+      if (child.exitCode === null) {
+        await new Promise((resolve) => {
+          child.once("exit", resolve);
+          child.stdin.end();
+        });
+      }
+      if (temporaryLease) await rm(temporaryLease, { recursive: true, force: true });
     },
   };
 }

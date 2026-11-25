@@ -89,7 +89,7 @@
       "required": ["id", "width", "height", "devicePixelRatio"],
       "properties": {
         "id": { "$ref": "#/$defs/id" },
-        "width": { "enum": [320, 375, 402, 430, 768, 1440] },
+        "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 8192 },
         "height": { "type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 100000 },
         "devicePixelRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 8 }
       },

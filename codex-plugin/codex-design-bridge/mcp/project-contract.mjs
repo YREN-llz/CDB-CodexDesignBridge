@@ -46,6 +46,7 @@ export async function createDesignProject({
   workspaceDir,
   description,
   projectName = "design-draft",
+  viewport,
 }) {
   const workspace = await normalizeDirectory(workspaceDir, "没有可写入设计的位置。");
   await recoverAbandonedProjectStaging(workspace);
@@ -59,7 +60,7 @@ export async function createDesignProject({
   const manifest = createManifest({
     name: title,
     projectId: stableId(path.basename(targetDir)),
-    htmlPages: [{ entry: "index.html", name: "Home", route: "/" }],
+    htmlPages: [{ entry: "index.html", name: "Home", route: "/", viewport }],
     sourceKind: "cdb-native",
   });
 
@@ -1178,8 +1179,8 @@ function normalizeViewport(value) {
   const width = Number.isInteger(value?.width) ? value.width : DEFAULT_VIEWPORT.width;
   const height = Number.isInteger(value?.height) ? value.height : DEFAULT_VIEWPORT.height;
   return {
-    width: Math.min(1920, Math.max(320, width)),
-    height: Math.min(1200, Math.max(480, height)),
+    width: Math.min(8192, Math.max(1, width)),
+    height: Math.min(8192, Math.max(1, height)),
   };
 }
 

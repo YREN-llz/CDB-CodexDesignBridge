@@ -1,5 +1,5 @@
 export const CDB_PUBLIC_VERSION = "0.9.0";
-export const CDB_EXACT_BUILD = "0.9.0+codex.20260829100031";
+export const CDB_EXACT_BUILD = "0.9.0+codex.20261125201405";
 export const CDB_BRIDGE_PROTOCOL_VERSION = 16;
 export const CDB_PAGE_IR_SCHEMA_VERSION = 2;
 export const CDB_RUNTIME_IDENTITY = "cdb-0.9-responsive-v2";

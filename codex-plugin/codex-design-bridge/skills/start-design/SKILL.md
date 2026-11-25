@@ -32,7 +32,7 @@ Only inspect `.cdb/manifest.json`, root HTML entries, or a user-selected directo
 
 When the user says `@CDB 新建设计：<描述>` or gives an equivalent description:
 
-1. Call `create_design_project` immediately with the current writable workspace and the full description.
+1. Call `create_design_project` immediately with the current writable workspace and the full description. If the user specifies both artboard dimensions, pass them as `viewport.width` and `viewport.height` in CSS pixels.
 2. Do not ask about framework, package manager, port, page count, or project name.
 3. The tool creates `index.html`, `styles.css`, `assets/`, `AGENTS.md`, and `.cdb/manifest.json`, runs preflight, and opens the workspace.
 4. If no writable workspace exists, ask only for a save location.
