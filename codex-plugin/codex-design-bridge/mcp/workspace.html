@@ -1404,11 +1404,15 @@
         background: #09090c;
       }
 
-      .preview-stage.is-pannable .preview-frame {
+      .preview-stage.is-panning .preview-frame {
         pointer-events: none;
       }
 
       .preview-stage.is-panning .viewport {
+        transition: none;
+      }
+
+      .viewport:has(.preview-frame:not([hidden])) {
         transition: none;
       }
 
@@ -1801,6 +1805,7 @@
               <button id="zoomOutButton" type="button" title="缩小视图" aria-label="缩小视图">−</button>
               <strong id="zoomValue">100%</strong>
               <button id="zoomInButton" type="button" title="放大视图" aria-label="放大视图">＋</button>
+              <button id="staticPreviewButton" type="button" title="切换到完整页面静态预览" aria-label="查看整页静态图">整页图</button>
             </div>
           </div>
         </div>
@@ -1988,6 +1993,7 @@
           sendAllLabel: document.getElementById("sendAllButtonLabel"),
           zoomOut: document.getElementById("zoomOutButton"),
           previewMode: document.getElementById("previewModeSelect"),
+          staticPreview: document.getElementById("staticPreviewButton"),
           zoomValue: document.getElementById("zoomValue"),
           zoomIn: document.getElementById("zoomInButton"),
           figma: document.getElementById("figmaButton"),
@@ -2115,6 +2121,16 @@
         elements.preview.addEventListener("error", () => {
           void loadPreviewFallback(previewRequestId);
         });
+        document.addEventListener("securitypolicyviolation", (event) => {
+          if (event.effectiveDirective !== "frame-src" ||
+              !state.previewUrl || previewUsingFallback) return;
+          const previewOrigin = new URL(state.previewUrl).origin;
+          if (String(event.blockedURI || "").startsWith(previewOrigin)) {
+            clearTimeout(previewLoadTimer);
+            elements.preview.removeAttribute("src");
+            void loadPreviewFallback(previewRequestId);
+          }
+        });
         elements.verificationReview.addEventListener("click", () => {
           void openVerificationReview();
         });
@@ -2148,6 +2164,19 @@
           applyPreviewTransform();
           if (state.previewUrl) loadPreview();
           render();
+        });
+
+        elements.staticPreview.addEventListener("click", () => {
+          if (!state.previewUrl) return;
+          if (previewUsingFallback) {
+            loadPreview();
+            render();
+          } else {
+            previewRequestId += 1;
+            clearTimeout(previewLoadTimer);
+            elements.preview.removeAttribute("src");
+            void loadPreviewFallback(previewRequestId);
+          }
         });
 
         elements.refresh.addEventListener("click", async () => {
@@ -3048,11 +3077,14 @@
               ? `验收断点 ${previewViewport.width}`
               : "适应窗口";
           const displayScale = (previewMode === "one-to-one" ? 1 : previewFitScale) * (previewZoom / 100);
-          elements.viewportLabel.textContent = `${previewViewport.width} × ${previewViewport.height} · ${modeLabel} · 展示 ${Math.round(displayScale * 100)}%`;
+          elements.viewportLabel.textContent = `${previewViewport.width} × ${previewViewport.height} · ${modeLabel} · 展示 ${Math.round(displayScale * 100)}%${previewReady && previewUsingFallback ? " · 静态备用图，点击 HTML 可交互" : ""}`;
           renderVerificationEvidence(activePage);
           elements.zoomValue.textContent = `${previewZoom}%`;
           elements.zoomOut.disabled = previewZoom <= PREVIEW_MIN_ZOOM;
           elements.zoomIn.disabled = previewZoom >= PREVIEW_MAX_ZOOM;
+          elements.staticPreview.textContent = previewUsingFallback ? "交互" : "整页图";
+          elements.staticPreview.title = previewUsingFallback ? "返回可交互 HTML 预览" : "切换到完整页面静态预览";
+          elements.staticPreview.setAttribute("aria-label", elements.staticPreview.title);
           applyPreviewTransform();
           elements.workspaceLabel.textContent = state.figmaConnected
             ? "已连接"
@@ -3631,7 +3663,7 @@
             if (requestId === previewRequestId && !previewReady) {
               void loadPreviewFallback(requestId);
             }
-          }, 2_500);
+          }, 12_000);
         }
 
         async function loadPreviewFallback(requestId) {
@@ -3653,6 +3685,7 @@
             fitContent: true,
           }, { silent: true, timeoutMs: 45_000 });
           if (requestId !== previewRequestId) return;
+          if (previewReady && !previewUsingFallback) return;
 
           const image = readPreviewImage(result);
           previewReady = false;
@@ -3715,12 +3748,7 @@
         }
 
         function canUseLivePreview() {
-          // The workspace itself is already hosted inside an MCP Apps iframe.
-          // A nested localhost iframe can be replaced by the browser's blocked
-          // error document, which still fires `load` and looks successful to us.
-          // Always use the CDB-rendered image inside the workspace; the HTML
-          // button remains the interactive, browser-hosted preview path.
-          return false;
+          return Boolean(activePreviewUrl());
         }
 
         function renderDisplayMode() {

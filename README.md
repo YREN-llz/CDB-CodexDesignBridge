@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 CDB connects Codex, local HTML/CSS projects, and Figma Desktop. It moves pages between source code and editable Figma layers, then writes supported design changes back through guarded local transactions.
 
-> **This is a public beta, not a production-stable release.** The public version is `0.9.0`; the current exact build is `0.9.0+codex.20261125201405`. The primary macOS path has real desktop evidence. Windows installers and automation are ready, but real Codex/Figma Desktop acceptance is still pending. When anything breaks, Codex can inspect this repository, diagnose the exact build, patch the implementation, run tests, and reinstall CDB.
+> **This is a public beta, not a production-stable release.** The public version is `0.9.0`; the current exact build is `0.9.0+codex.20261125202836`. The primary macOS path has real desktop evidence. Windows installers and automation are ready, but real Codex/Figma Desktop acceptance is still pending. When anything breaks, Codex can inspect this repository, diagnose the exact build, patch the implementation, run tests, and reinstall CDB.
 
 ## Best-fit projects
 
@@ -14,7 +14,7 @@ CDB currently works best with explicit, locally runnable static HTML/CSS pages.
 - Figma → HTML: create a project, add a page, or update an already linked page from one complete top-level frame.
 - Round trips: supported text, color, size, opacity, radius, stroke, typography, Flex/Auto Layout, basic Grid, constraints, and selected structural edits.
 - Multi-page and responsive review: isolated page identity plus `320 / 375 / 402 / 430 / 768 / 1440` acceptance widths.
-- HTML preview fits the full page at the selected width. New projects can specify a canvas size, and Figma imports preserve the frame dimensions.
+- HTML preview runs the live page with clicks, forms, scrolling, and navigation. Use the full-page image button to switch to a complete screenshot. New projects can specify a canvas size, and Figma imports preserve the frame dimensions.
 - Guarded writes: source hashes, shared baselines, multi-file transactions, live browser verification, and Undo.
 
 React, Vue, Vite, CSS-in-JS, complex runtime DOM, complete Figma Variables/Variants, and prototype animation are not fully supported by this beta.

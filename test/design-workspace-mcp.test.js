@@ -263,7 +263,7 @@ test("publishes the design workspace as an MCP Apps resource", async (t) => {
   assert.match(resource.contents[0].text, /new URL\(pagePath, `\$\{base\.origin\}\/`\)/);
   assert.match(
     resource.contents[0].text,
-    /function canUseLivePreview\(\)[\s\S]*?return false;/,
+    /function canUseLivePreview\(\)[\s\S]*?return Boolean\(activePreviewUrl\(\)\);/,
   );
   assert.match(resource.contents[0].text, /mode: requestedMode/);
   assert.match(resource.contents[0].text, /\? "inline" : "fullscreen"/);

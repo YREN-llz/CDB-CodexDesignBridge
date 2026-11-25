@@ -17,7 +17,7 @@ import { SyncBaselineStore } from "../codex-plugin/codex-design-bridge/mcp/sync-
 import { preparePageManifest } from "../codex-plugin/codex-design-bridge/shared/page.mjs";
 import { responsivePageIrToPageSeedNode as pageIrToPageSeedNode } from "../codex-plugin/codex-design-bridge/shared/page-ir-responsive-v2.mjs";
 
-function runtimeIdentity(exactBuild = "0.9.0+codex.20261125201405") {
+function runtimeIdentity(exactBuild = "0.9.0+codex.20261125202836") {
   return {
     kind: "cdb-0.9-responsive-v2",
     protocolVersion: 16,
@@ -40,7 +40,7 @@ test("accepts protocol 16 exact-build design offers idempotently and replays res
   const offerStore = new DesignOfferStore(path.join(projectDir, "offers.json"));
   const bridge = new LocalFigmaBridge(projectDir, {
     port: 0,
-    runtimeVersion: "0.9.0+codex.20261125201405",
+    runtimeVersion: "0.9.0+codex.20261125202836",
     offerStore,
     onDesignPayload: async (receivedOffer) => ({
       projectDir: path.join(projectDir, "generated"),
@@ -172,7 +172,7 @@ test("replaces an older project connection and sends page imports only to the la
   const projectDir = await mkdtemp(path.join(os.tmpdir(), "local-figma-client-replace-"));
   const bridge = new LocalFigmaBridge(projectDir, {
     port: 0,
-    runtimeVersion: "0.9.0+codex.20261125201405",
+    runtimeVersion: "0.9.0+codex.20261125202836",
     projectKey: "shared-project-key",
   });
   await bridge.start();
@@ -247,7 +247,7 @@ test("honors the configured Figma long-operation timeout for a slow page import"
   const projectDir = await mkdtemp(path.join(os.tmpdir(), "local-figma-slow-import-"));
   const bridge = new LocalFigmaBridge(projectDir, {
     port: 0,
-    runtimeVersion: "0.9.0+codex.20261125201405",
+    runtimeVersion: "0.9.0+codex.20261125202836",
     projectKey: "slow-import-project",
     operationTimeoutMs: 100,
   });
@@ -312,7 +312,7 @@ test("local Figma bridge auto-pairs, imports a page, and stores changes", async 
   await writeFile(path.join(projectDir, "styles.css"), "", "utf8");
   const bridge = new LocalFigmaBridge(projectDir, {
     port: 0,
-    runtimeVersion: "0.9.0+codex.20261125201405",
+    runtimeVersion: "0.9.0+codex.20261125202836",
     onFastApply: async (result) => ({
       sourceHash: `synced-${result.pageId}`,
     }),
@@ -434,7 +434,7 @@ test("local Figma bridge auto-pairs, imports a page, and stores changes", async 
   );
   const ready = await inbox.next("plugin.ready");
   assert.equal(ready.protocolVersion, 16);
-  assert.equal(ready.runtimeVersion, "0.9.0+codex.20261125201405");
+  assert.equal(ready.runtimeVersion, "0.9.0+codex.20261125202836");
   assert.equal(ready.localWorkspace, true);
   assert.deepEqual(bridge.status().figmaPluginVersions, ["0.9.0"]);
   assert.equal(bridge.status().connected, true);
