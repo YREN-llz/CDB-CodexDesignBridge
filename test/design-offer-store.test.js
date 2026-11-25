@@ -28,6 +28,10 @@ test("stores protocol 16 offers atomically and restores only the current exact i
   const restored = new DesignOfferStore(filePath);
   assert.equal((await restored.get("offer-12345678")).state, "accepted");
   assert.equal(JSON.parse(await readFile(filePath, "utf8")).protocolVersion, 16);
+  await store.transition("offer-12345678", "failed", { error: "Frame 无法导出" });
+  assert.equal((await store.list()).length, 0);
+  const failures = await store.list({ includeFailures: true });
+  assert.equal(failures[0].error, "Frame 无法导出");
 });
 
 test("rejects conflicting, unsupported, and oversized offers", async (t) => {
@@ -213,7 +217,7 @@ function sampleVisualReference() {
   };
 }
 
-function runtimeIdentity(exactBuild = "0.9.0+codex.20261125204135") {
+function runtimeIdentity(exactBuild = "0.9.0+codex.20261125211155") {
   return {
     kind: "cdb-0.9-responsive-v2",
     protocolVersion: 16,

@@ -1,7 +1,7 @@
 import { computeHash, prepareSvgAsset } from "./svg.mjs";
 import { createResponsivePageIrFromNodeTree } from "./page-ir-responsive-v2.mjs";
 
-const MAX_PAGE_BYTES = 2 * 1024 * 1024;
+const MAX_PAGE_BYTES = 34 * 1024 * 1024;
 const MAX_NODES = 500;
 const NODE_TYPES = new Set(["frame", "image", "text", "svg"]);
 const ID_PATTERN = /^[A-Za-z][A-Za-z0-9._-]*$/;
@@ -19,7 +19,7 @@ export function preparePageManifest({ json, sourcePath }) {
     throw new PageValidationError("Page manifest is empty.");
   }
   if (Buffer.byteLength(json, "utf8") > MAX_PAGE_BYTES) {
-    throw new PageValidationError("Page manifest exceeds the 2 MB limit.");
+    throw new PageValidationError("Page manifest exceeds the 34 MB limit.");
   }
 
   let value;

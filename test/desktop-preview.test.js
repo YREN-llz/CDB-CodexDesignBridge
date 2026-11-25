@@ -29,6 +29,40 @@ import {
   startProjectPreview,
 } from "../desktop/preview-service.js";
 import { preparePageManifest } from "../src/page.js";
+import { solidVisualReference } from "./helpers/visual-reference.js";
+import { decodePng } from "../codex-plugin/codex-design-bridge/mcp/visual-verification.mjs";
+
+test("embeds large local images and CSS backgrounds in editable Figma payloads", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cdb-image-transfer-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const png = Buffer.from(solidVisualReference(100, 50, [225, 36, 50, 255]).base64, "base64");
+  await writeFile(path.join(root, "generated.png"), Buffer.concat([png, Buffer.alloc(2 * 1024 * 1024)]));
+  await writeFile(path.join(root, "index.html"), `<!doctype html>
+    <style>
+      #background { width: 300px; height: 100px; background: url('./generated.png') no-repeat 100% center / auto 100%; }
+    </style>
+    <main data-codex-root data-codex-id="root">
+      <img src="./generated.png" data-codex-id="generated" width="200" height="100">
+      <div id="background" data-codex-id="background"><span data-codex-id="caption">Caption</span></div>
+    </main>`);
+  const preview = await startProjectPreview({ rootDirectory: root });
+  t.after(() => preview.stop());
+  const { manifest } = await captureLocalPreview({ previewUrl: preview.url, projectDir: root });
+  const image = findNode(manifest.root, "generated");
+  assert.equal(image.type, "image");
+  assert.ok(Buffer.from(image.image.base64, "base64").length <= 1024 * 1024);
+  assert.equal(decodePng(Buffer.from(image.image.base64, "base64")).width, 100);
+  const background = findNode(manifest.root, "background");
+  assert.equal(background.children[0].type, "image");
+  assert.equal(background.children[0].layoutItem.positioning, "absolute");
+  assert.equal(background.children[0].width, 300);
+  assert.ok(findNode(background, "caption"));
+  const captured = decodePng(Buffer.from(background.children[0].image.base64, "base64"));
+  assert.equal(captured.data[(50 * captured.width + 290) * 4], 225);
+  assert.equal(captured.data[(50 * captured.width + 10) * 4 + 3], 0);
+  const prepared = preparePageManifest({ json: JSON.stringify(manifest), sourcePath: "preview.json" });
+  assert.equal(findNode(prepared.root, "generated").type, "image");
+});
 
 test("chooses a frontend preview script without starting another Bridge", () => {
   assert.equal(

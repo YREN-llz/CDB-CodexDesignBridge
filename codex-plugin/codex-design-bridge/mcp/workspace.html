@@ -1566,6 +1566,22 @@
 
       dialog { border-radius: 10px; }
 
+      .operation-error {
+        position: fixed;
+        left: 20px;
+        right: 20px;
+        bottom: 76px;
+        z-index: 30;
+        margin: 0;
+        padding: 12px 16px;
+        border: 1px solid #b44b5b;
+        border-radius: 8px;
+        background: #351e24;
+        color: #ffd5db;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
       .launcher {
         width: min(760px, calc(100% - 32px));
         margin: auto;
@@ -1636,6 +1652,7 @@
   </head>
   <body>
     <main class="app">
+      <p id="operationError" class="operation-error" role="alert" hidden></p>
       <section class="launcher" id="launcherView" aria-label="CDB 启动器" hidden>
         <h1>CDB</h1>
         <p>从本地静态项目或现有 Figma 页面开始。</p>
@@ -1929,6 +1946,7 @@
             : null,
         };
         const elements = {
+          operationError: document.getElementById("operationError"),
           launcher: document.getElementById("launcherView"),
           workspace: document.getElementById("workspaceView"),
           launcherDropZone: document.getElementById("launcherDropZone"),
@@ -2697,10 +2715,7 @@
         }
 
         async function poll() {
-          if (
-            polling ||
-            (state.mode !== "launcher" && state.sessionActive === false)
-          ) return;
+          if (polling) return;
           if (!state.projectDir && !(state.mode === "launcher" && state.launcherId)) return;
           polling = true;
           try {
@@ -2726,12 +2741,19 @@
         ) {
           if (!bridge?.callTool) return null;
           try {
-            return await withTimeout(
+            const result = await withTimeout(
               Promise.resolve().then(() => bridge.callTool(name, args, timeoutMs)),
               timeoutMs,
             );
+            if (result?.isError) {
+              throw new Error(result.content?.find((item) => item.type === "text")?.text || "CDB 操作失败，请重试。");
+            }
+            if (!silent) elements.operationError.hidden = true;
+            return result;
           } catch (error) {
             if (!silent) {
+              elements.operationError.textContent = error?.message || "CDB 操作失败，请重试。";
+              elements.operationError.hidden = false;
               setState({
                 ...state,
                 phase: "error",
@@ -2890,11 +2912,6 @@
         }
 
         function ensurePolling() {
-          if (state.mode !== "launcher" && state.sessionActive === false) {
-            clearInterval(pollTimer);
-            pollTimer = null;
-            return;
-          }
           const hasTarget = state.projectDir || (state.mode === "launcher" && state.launcherId);
           if (pollTimer || !bridge?.callTool || !hasTarget) return;
           pollTimer = window.setInterval(poll, 2200);
@@ -3514,13 +3531,16 @@
             title.textContent = `来自 Figma：${offer.rootName || "未命名页面"}`;
             const meta = document.createElement("p");
             meta.textContent = `${Math.round(offer.width || 0)} × ${Math.round(offer.height || 0)} · ${offer.estimatedNodeCount || 0} 个可编辑图层`;
+            meta.textContent += offer.state === "failed"
+              ? ` · 接收失败：${offer.error || "请在 Figma 重新发送"}`
+              : offer.state === "accepted" ? " · 等待 Figma 返回完整页面" : " · 等待接收";
             const actions = document.createElement("div");
             actions.className = "launcher-actions";
             const create = document.createElement("button");
             create.className = "button";
             create.type = "button";
             create.textContent = "创建新项目";
-            create.disabled = !state.workspaceDir || ["accepted", "collecting"].includes(offer.state);
+            create.disabled = !state.workspaceDir || ["accepted", "collecting", "failed"].includes(offer.state);
             create.title = state.workspaceDir ? "采集完整 Frame 并生成本地静态项目" : "当前任务没有可写入位置";
             create.addEventListener("click", async () => {
               create.disabled = true;
@@ -3578,7 +3598,7 @@
               state.preflightReport?.projectKey &&
               offer.linkedProjectKey !== state.preflightReport.projectKey
             );
-            add.disabled = busy || crossProject || ["accepted", "collecting"].includes(offer.state);
+            add.disabled = busy || crossProject || ["accepted", "collecting", "failed"].includes(offer.state);
             add.title = crossProject
                 ? "这个 Frame 已关联到另一个项目"
               : linked
@@ -3594,7 +3614,27 @@
               }, { timeoutMs: 30_000 });
               if (result) applyToolResult(result);
             });
-            card.append(title, add);
+            const create = document.createElement("button");
+            create.className = "button secondary";
+            create.type = "button";
+            create.textContent = "创建独立项目";
+            create.title = "将这份 Figma 设计接收为新的本地项目";
+            create.disabled = busy || ["accepted", "collecting", "failed"].includes(offer.state);
+            create.addEventListener("click", async () => {
+              create.disabled = true;
+              const result = await callTool("accept_figma_design_offer", {
+                offerId: offer.offerId,
+                action: "create_project",
+                projectDir: state.projectDir,
+              }, { timeoutMs: 30_000 });
+              if (result) applyToolResult(result);
+            });
+            card.append(title, add, create);
+            if (offer.error) {
+              const error = document.createElement("p");
+              error.textContent = `接收失败：${offer.error}。请在 Figma 重新发送。`;
+              card.append(error);
+            }
             elements.workspaceOffers.append(card);
           }
         }

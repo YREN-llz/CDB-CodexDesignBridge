@@ -41,8 +41,18 @@ test("HTML preview supports buttons, forms, scrolling and navigation while zoome
     mode: "workspace", phase: "ready", projectDir: "/test", projectName: "Interaction test",
     pages: [{ id: "home", name: "Home", path: "/", viewport: { width: 390, height: 844 } }],
     activePageId: "home", previewUrl, previewRevision: 1, sessionActive: true,
+    preflightReport: { projectKey: "test-project", status: "pass" },
+    designOffers: [{
+      offerId: "offer-other-project",
+      rootName: "Other project page",
+      linkedProjectKey: "other-project",
+      linkedPageId: "other-page",
+      state: "pending",
+    }],
   };
   let screenshots = 0;
+  let acceptedOffer;
+  let acceptAttempts = 0;
   const html = await readFile(process.env.CDB_WORKSPACE_HTML_PATH ||
     new URL("../codex-plugin/codex-design-bridge/mcp/workspace.html", import.meta.url), "utf8");
   const server = await startLocalWorkspaceServer({
@@ -50,6 +60,12 @@ test("HTML preview supports buttons, forms, scrolling and navigation while zoome
     handleRequest: async (method, params) => {
       if (method === "resources/read") return { contents: [{ text: html }] };
       if (params.name === "get_cdb_health") return { structuredContent: { health: { activeProject: "/test" } } };
+      if (params.name === "accept_figma_design_offer") {
+        acceptedOffer = params.arguments;
+        if (++acceptAttempts === 1) {
+          return { isError: true, content: [{ type: "text", text: "Figma 已断开，请重新打开 CDB 插件" }] };
+        }
+      }
       if (params.name === "get_design_preview_image") {
         screenshots += 1;
         const image = solidVisualReference(100, 100);
@@ -83,6 +99,12 @@ test("HTML preview supports buttons, forms, scrolling and navigation while zoome
   await frame.getByRole("heading", { name: "Next page" }).waitFor();
   assert.equal(screenshots, 0);
   assert.equal(await page.locator("#previewFallback").isVisible(), false);
+  assert.equal(await page.getByRole("button", { name: "更新关联页面", exact: true }).isEnabled(), false);
+  await page.getByRole("button", { name: "创建独立项目", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "Figma 已断开，请重新打开 CDB 插件" }).waitFor();
+  await page.getByRole("button", { name: "创建独立项目", exact: true }).click();
+  assert.equal(acceptedOffer.action, "create_project");
+  assert.equal(acceptedOffer.offerId, "offer-other-project");
   await page.getByRole("button", { name: "切换到完整页面静态预览" }).click();
   await page.locator("#previewFallback").waitFor({ state: "visible" });
   assert.equal(screenshots, 1);

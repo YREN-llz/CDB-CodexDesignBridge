@@ -92,7 +92,7 @@ export class BridgeServer {
         sendJson(response, 500, { error: "internal_error", message: error.message });
       });
     });
-    this.webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+    this.webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 34 * 1024 * 1024 });
     this.httpServer.on("upgrade", (request, socket, head) => {
       const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
       if (url.pathname !== "/ws" || url.searchParams.get("token") !== this.token) {

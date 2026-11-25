@@ -724,7 +724,6 @@ test("creates a local project from a protocol 16 offer and returns stable Figma 
     arguments: {
       offerId: updateOfferId,
       action: "update_page",
-      launcherId: updateLauncherId,
       projectDir,
       pageId: result.result.pageId,
     },

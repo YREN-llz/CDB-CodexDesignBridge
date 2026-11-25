@@ -976,6 +976,7 @@ async function callTool(name, args) {
     }
     case "get_design_workspace_state": {
       const state = await getWorkspace(args.projectDir);
+      state.designOffers = await designOfferStore.list({ includeFailures: true });
       return toolResult(state, state.message);
     }
     case "open_design_preview_in_browser": {
@@ -1121,7 +1122,7 @@ async function openDesignLauncher({ workspaceDir } = {}) {
     .update(`${process.pid}:${Date.now()}:${Math.random()}`)
     .digest("hex")
     .slice(0, 20);
-  const offers = await designOfferStore.list();
+  const offers = await designOfferStore.list({ includeFailures: true });
   const state = {
     mode: "launcher",
     launcherId,
@@ -1192,7 +1193,7 @@ async function refreshLauncherOffers(launcherId) {
     launcherStates.set(state.launcherId, transitioned);
     return publicState(transitioned);
   }
-  const offers = await designOfferStore.list();
+  const offers = await designOfferStore.list({ includeFailures: true });
   state.designOffers = offers;
   state.bridgeReady = Boolean(launcherBridge);
   state.figmaConnected = Boolean(launcherBridge?.status().connected);
@@ -1210,20 +1211,28 @@ async function acceptLauncherOffer({ launcherId, offerId, action, workspaceDir, 
   const resolvedProject = projectDir ? await normalizeProjectDir(projectDir) : "";
   const state = launcherState || (resolvedProject ? await getWorkspace(resolvedProject) : null);
   if (!state) throw new Error("CDB 启动器或项目工作台已经失效，请重新打开。");
-  const bridge = launcherState
+  const offer = await designOfferStore.get(offerId);
+  if (!offer) throw new Error("没有找到这个 Figma 设计提案。");
+  const connectedBridge = [launcherBridge, ...figmaBridges.values()].find(
+    (candidate) => candidate?.allReadyClients().some(
+      (client) => client.sessionId === offer.sessionId,
+    ),
+  );
+  const bridge = connectedBridge || (launcherState?.mode === "launcher"
     ? await ensureLauncherFigmaBridge()
-    : await ensureLocalFigmaBridge(resolvedProject);
+    : await ensureLocalFigmaBridge(resolvedProject || launcherState.projectDir));
   const target = {
     action,
     launcherId: launcherState?.launcherId || "",
-    workspaceDir: String(workspaceDir || state.workspaceDir || ""),
+    workspaceDir: String(workspaceDir || state.workspaceDir ||
+      (resolvedProject && action === "create_project" ? path.dirname(resolvedProject) : "")),
     projectDir: resolvedProject,
     pageId: String(pageId || ""),
   };
   await bridge.acceptDesignOffer(offerId, target);
   const updated = {
     ...state,
-    designOffers: await designOfferStore.list(),
+    designOffers: await designOfferStore.list({ includeFailures: true }),
     message: "已请求 Figma 重新采集完整页面。",
     updatedAt: new Date().toISOString(),
   };

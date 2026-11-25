@@ -36,7 +36,7 @@
         "kind": { "const": "cdb-0.9-responsive-v2" },
         "protocolVersion": { "const": 16 },
         "pageIrSchemaVersion": { "const": 2 },
-        "exactBuild": { "const": "0.9.0+codex.20261125204135" }
+        "exactBuild": { "const": "0.9.0+codex.20261125211155" }
       },
       "additionalProperties": false
     },

@@ -136,6 +136,7 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
   ]);
   const externalSvgByElement = new Map();
   const rasterImageByElement = new Map();
+  const backgroundImageByElement = new Map();
   const usedIds = new Set();
   let generatedId = 0;
   let nodeCount = 0;
@@ -588,6 +589,20 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     if (!pseudoExists(style) || style.display === "none" || style.visibility === "hidden") {
       return null;
     }
+    const backgroundImage = backgroundImageByElement.get(element);
+    if (backgroundImage) {
+      nodeCount += 1;
+      node.children.push({
+        id: uniqueId(element, "background-image"),
+        type: "image",
+        name: id + " background image",
+        x: 0, y: 0, width: geometry.width, height: geometry.height,
+        opacity: 1, rotation: 0, style: {}, objectFit: "fill",
+        layoutItem: { positioning: "absolute" },
+        image: { mimeType: backgroundImage.mimeType, base64: backgroundImage.base64 },
+      });
+    }
+
     const triangle = borderTriangle(style);
     const size = triangle || cssBoxSize(style);
     if (size.width <= 0.5 || size.height <= 0.5) return null;
@@ -916,44 +931,112 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
     }
   }
 
-  async function loadRasterImage(element) {
-    try {
-      const url = new URL(element.currentSrc || element.src, location.href);
-      if (url.origin !== location.origin || /\.svg(?:$|[?#])/i.test(url.href)) {
-        return null;
+  function imageResource(canvas, file) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const dataUrl = canvas.toDataURL("image/png");
+      const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
+      if (base64.length <= 1360 * 1024) {
+        return { file, mimeType: "image/png", base64 };
       }
-      const response = await fetch(url.href, {
-        credentials: "same-origin",
-        cache: "no-store",
-      });
-      const responseUrl = new URL(response.url || url.href);
-      const mimeType = String(response.headers.get("content-type") || "")
-        .split(";")[0]
-        .trim()
-        .toLowerCase();
-      if (
-        !response.ok ||
-        responseUrl.origin !== location.origin ||
-        !["image/png", "image/jpeg", "image/webp"].includes(mimeType)
-      ) {
-        return null;
-      }
-      const declaredLength = Number(response.headers.get("content-length") || 0);
-      if (declaredLength > 1024 * 1024) return null;
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.length === 0 || bytes.length > 1024 * 1024) return null;
-      let binary = "";
-      for (let offset = 0; offset < bytes.length; offset += 8192) {
-        binary += String.fromCharCode(...bytes.slice(offset, offset + 8192));
-      }
-      return {
-        file: projectFileFromUrl(url),
-        mimeType,
-        base64: btoa(binary),
-      };
-    } catch {
-      return null;
+      const reduced = document.createElement("canvas");
+      reduced.width = Math.max(1, Math.floor(canvas.width * 0.75));
+      reduced.height = Math.max(1, Math.floor(canvas.height * 0.75));
+      reduced.getContext("2d").drawImage(canvas, 0, 0, reduced.width, reduced.height);
+      canvas = reduced;
     }
+    throw new Error("图片压缩后仍超过传输限制");
+  }
+
+  async function fetchRaster(source) {
+    const url = new URL(source, document.baseURI);
+    if (url.origin !== location.origin || /\.svg(?:$|[?#])/i.test(url.href)) return null;
+    const response = await fetch(url.href, { credentials: "same-origin", cache: "no-store" });
+    if (!response.ok || new URL(response.url || url.href).origin !== location.origin) return null;
+    const mimeType = String(response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) return null;
+    if (Number(response.headers.get("content-length") || 0) > 32 * 1024 * 1024) {
+      throw new Error("图片超过 32 MB 采集限制：" + url.pathname);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (!bytes.length || bytes.length > 32 * 1024 * 1024) throw new Error("图片大小无效：" + url.pathname);
+    return { url, bytes, mimeType };
+  }
+
+  async function loadRasterImage(element) {
+    const resource = await fetchRaster(element.currentSrc || element.src);
+    if (!resource) return null;
+    const file = projectFileFromUrl(resource.url);
+    if (resource.bytes.length <= 1024 * 1024) {
+      let binary = "";
+      for (let offset = 0; offset < resource.bytes.length; offset += 8192) {
+        binary += String.fromCharCode(...resource.bytes.subarray(offset, offset + 8192));
+      }
+      return { file, mimeType: resource.mimeType, base64: btoa(binary) };
+    }
+    const bitmap = await createImageBitmap(new Blob([resource.bytes], { type: resource.mimeType }));
+    try {
+      const scale = Math.min(1, 4096 / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      return imageResource(canvas, file);
+    } finally {
+      bitmap.close();
+    }
+  }
+
+  function backgroundLength(value, extent, fallback) {
+    if (String(value).endsWith("%")) return extent * parseFloat(value) / 100;
+    return value === "auto" || !value ? fallback : parseFloat(value);
+  }
+
+  async function loadBackgroundImage(element) {
+    const style = getComputedStyle(element);
+    const layers = splitCssLayers(style.backgroundImage || "");
+    if (layers.length !== 1) return null;
+    const match = /^url\(["']?(.*?)["']?\)$/.exec(layers[0].trim());
+    if (!match) return null;
+    const resource = await fetchRaster(match[1]);
+    if (!resource) return null;
+    const bitmap = await createImageBitmap(new Blob([resource.bytes], { type: resource.mimeType }));
+    try {
+      const width = element.clientWidth;
+      const height = element.clientHeight;
+      if (!width || !height) return null;
+      const scale = Math.min(1, 2048 / Math.max(width, height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(width * scale));
+      canvas.height = Math.max(1, Math.round(height * scale));
+      const context = canvas.getContext("2d");
+      context.scale(scale, scale);
+      let drawWidth = bitmap.width, drawHeight = bitmap.height;
+      if (["cover", "contain"].includes(style.backgroundSize)) {
+        const ratio = Math[style.backgroundSize === "cover" ? "max" : "min"](width / drawWidth, height / drawHeight);
+        drawWidth *= ratio;
+        drawHeight *= ratio;
+      } else {
+        const sizes = style.backgroundSize.split(/\s+/);
+        drawWidth = backgroundLength(sizes[0], width, bitmap.width);
+        drawHeight = backgroundLength(sizes[1], height, bitmap.height);
+        if (sizes[0] === "auto" && sizes[1] !== "auto" && sizes[1]) drawWidth = drawHeight * bitmap.width / bitmap.height;
+        if ((!sizes[1] || sizes[1] === "auto") && sizes[0] !== "auto") drawHeight = drawWidth * bitmap.height / bitmap.width;
+      }
+      if (!(drawWidth > 0 && drawHeight > 0)) return null;
+      const x = backgroundLength(style.backgroundPositionX, width - drawWidth, 0);
+      const y = backgroundLength(style.backgroundPositionY, height - drawHeight, 0);
+      const repeatX = ["repeat", "repeat-x"].includes(style.backgroundRepeat);
+      const repeatY = ["repeat", "repeat-y"].includes(style.backgroundRepeat);
+      if (repeatX || repeatY) {
+        const pattern = context.createPattern(bitmap, repeatX && repeatY ? "repeat" : repeatX ? "repeat-x" : "repeat-y");
+        pattern.setTransform(new DOMMatrix().translate(x, y).scale(drawWidth / bitmap.width, drawHeight / bitmap.height));
+        context.fillStyle = pattern;
+        context.fillRect(0, 0, width, height);
+      } else {
+        context.drawImage(bitmap, x, y, drawWidth, drawHeight);
+      }
+      return imageResource(canvas, "");
+    } finally { bitmap.close(); }
   }
 
   function pixelValue(value) {
@@ -1241,6 +1324,20 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
       children: [],
     };
 
+    const backgroundImage = backgroundImageByElement.get(element);
+    if (backgroundImage) {
+      nodeCount += 1;
+      node.children.push({
+        id: uniqueId(element, "background-image"),
+        type: "image",
+        name: id + " background image",
+        x: 0, y: 0, width: geometry.width, height: geometry.height,
+        opacity: 1, rotation: 0, style: {}, objectFit: "fill",
+        layoutItem: { positioning: "absolute" },
+        image: { mimeType: backgroundImage.mimeType, base64: backgroundImage.base64 },
+      });
+    }
+
     const triangle = borderTriangle(style);
     if (triangle) {
       delete node.style.stroke;
@@ -1336,6 +1433,13 @@ export const CAPTURE_PAGE_SCRIPT = String.raw`
         if (rasterImage) rasterImageByElement.set(element, rasterImage);
       })
   );
+  await Promise.all([rootElement, ...rootElement.querySelectorAll("*")]
+    .filter(isVisible)
+    .filter((element) => getComputedStyle(element).backgroundImage.includes("url("))
+    .map(async (element) => {
+      const image = await loadBackgroundImage(element);
+      if (image) backgroundImageByElement.set(element, image);
+    }));
   const rootRect = rootElement.getBoundingClientRect();
   const root = buildNode(rootElement, rootRect, true);
   if (!root || root.type !== "frame") {

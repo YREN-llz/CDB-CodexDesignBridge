@@ -190,10 +190,10 @@ export class DesignOfferStore {
     return value ? { ...value } : null;
   }
 
-  async list({ includeTerminal = false } = {}) {
+  async list({ includeTerminal = false, includeFailures = false } = {}) {
     await this.load();
     return [...this.offers.values()]
-      .filter((offer) => includeTerminal || !TERMINAL_STATES.has(offer.state))
+      .filter((offer) => includeTerminal || (includeFailures && offer.state === "failed") || !TERMINAL_STATES.has(offer.state))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .map((offer) => ({ ...offer }));
   }
